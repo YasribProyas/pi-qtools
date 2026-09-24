@@ -1,13 +1,8 @@
 node_modules/
 .pi/
-out/
-*.log
-.DS_Store
+scripts-resync-session.sh
 
 # generated media
 out/
-*.mp4
-*.png.generated
-
-scripts-resync-session.sh
-out/
+*.log
+.DS_Store
