@@ -1,6 +1,6 @@
 {
   "name": "pi-qtools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Qwen Token Plan bridge for pi: web search, scraping, code interpreter, image search, and image/video generation via DashScope built-in tools and native task endpoints.",
   "type": "module",
   "keywords": ["pi-package", "pi", "pi-coding-agent", "qwen", "dashscope", "web-search", "web-scraping", "code-interpreter", "image-search", "image-generation", "video-generation"],
