@@ -1,0 +1,10 @@
+node_modules/
+.pi/
+out/
+*.log
+.DS_Store
+
+# generated media
+out/
+*.mp4
+*.png.generated

@@ -1,0 +1,17 @@
+{
+  "name": "pi-qtools",
+  "version": "0.1.0",
+  "description": "Qwen Token Plan bridge for pi: web search, code interpreter, image search, generation (image/video/TTS/ASR) and scraping via DashScope built-in tools and native endpoints.",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "qwen", "dashscope", "web-search", "image-generation", "video-generation", "tts", "asr"],
+  "license": "MIT",
+  "author": "proyas",
+  "files": ["extensions", "README.md", "LICENSE"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/qwen-tools.ts"]
+  }
+}
