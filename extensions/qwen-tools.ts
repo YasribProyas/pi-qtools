@@ -626,6 +626,24 @@ async function generateVideo(
 }
 
 /** Parse `/qimage a cat -m wan2.7-image-pro -s 1024*1024` style args. */
+/**
+ * Download a hosted media URL into <cwd>/out/qtools/. The commands do this because
+ * these signed OSS URLs are long enough to wrap across terminal rows, so copying one
+ * out of the notify panel reliably yields a truncated (failing) link.
+ */
+async function saveMedia(ctx: ExtensionContext, url: string, model: string, signal?: AbortSignal): Promise<string> {
+	const dir = join(ctx.cwd, "out", "qtools");
+	mkdirSync(dir, { recursive: true });
+	const ext = (url.split("?")[0].match(/\.(png|jpe?g|webp|mp4|wav|mp3)$/i) ?? [])[0]?.toLowerCase() || ".bin";
+	const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(0, 14);
+	const dest = join(dir, `${model}-${stamp}${ext}`);
+	const res = await fetch(url, { signal });
+	if (!res.ok) throw new Error(`download failed (${res.status}) for ${url.slice(0, 80)}`);
+	const buf = Buffer.from(await res.arrayBuffer());
+	writeFileSync(dest, buf);
+	return `${dest} (${(buf.length / 1024).toFixed(0)} KB)`;
+}
+
 function parseGenArgs(args: string, models: string[]): { prompt: string; model?: string; size?: string } {
 	const tokens = args.trim().split(/\s+/);
 	const parts: string[] = [];
@@ -1173,8 +1191,14 @@ export default function (pi: ExtensionAPI): void {
 			}
 			ctx.ui.notify(`Generating image with ${model || config.imageModel}...`, "info");
 			const r = await generateImage(ctx, { prompt, model, size });
-			if (r.urls.length) ctx.ui.notify(formatUrls("Image", r.model, r.urls), "success");
-			else ctx.ui.notify(`No image URL from ${r.model}: ${JSON.stringify(r.raw).slice(0, 240)}`, "error");
+			if (!r.urls.length) {
+				ctx.ui.notify(`No image URL from ${r.model}`, "error");
+				return;
+			}
+			// Save locally: the signed URLs wrap across terminal rows and are unreliable
+			// to copy out of the panel.
+			const saved = await Promise.all(r.urls.map((u) => saveMedia(ctx, u, r.model)));
+			ctx.ui.notify(`Image from ${r.model} saved:\n${saved.map((s) => "  " + s).join("\n")}`, "success");
 		},
 	});
 
@@ -1194,8 +1218,12 @@ export default function (pi: ExtensionAPI): void {
 				onTick: (st) => ctx.ui.notify(`video ${st}`, "info"),
 			});
 			void stop;
-			if (r.status === "SUCCEEDED" && r.url) ctx.ui.notify(`Video (${r.model}):\n${r.url}`, "success");
-			else ctx.ui.notify(`Video task ${r.status} (task ${r.taskId})`, "error");
+			if (r.status === "SUCCEEDED" && r.url) {
+				const saved = await saveMedia(ctx, r.url, r.model).catch((e) => `save failed: ${e.message}`);
+				ctx.ui.notify(`Video from ${r.model}:\n  ${saved}`, "success");
+			} else {
+				ctx.ui.notify(`Video task ${r.status} (task ${r.taskId})`, "error");
+			}
 		},
 	});
 

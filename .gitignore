@@ -10,3 +10,4 @@ out/
 *.png.generated
 
 scripts-resync-session.sh
+out/
