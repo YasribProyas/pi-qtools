@@ -58,13 +58,18 @@ jobs:
       - name: Inspect the exact tarball that would ship
         run: npm pack --dry-run
 
-      - name: Probe the npm OIDC token exchange (diagnostic)
-        # npm's oidc.js swallows exchange failures at verbose
-        # level and then publishes unauthenticated, which the
-        # registry reports as a misleading 404. Do the same
-        # exchange by hand and print the raw response so the
-        # real reason is visible in the job log.
+      - name: Exchange OIDC token for npm publish token
+        # Do the exchange explicitly and wire the returned npm token into
+        # NODE_AUTH_TOKEN so publish never falls back to an unauthenticated
+        # request (which npm reports as a misleading 404).
         run: |
+          pkg_name="$(node -p "require('./package.json').name")"
+          pkg_path="$(python3 - "$pkg_name" <<'PY'
+          import sys, urllib.parse
+          print(urllib.parse.quote(sys.argv[1], safe=''))
+          PY
+          )"
+
           curl -sS -o idtoken.json \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             -H "Accept: application/json" \
@@ -88,13 +93,25 @@ jobs:
           PY
           echo "--- exchange response ---"
           exch="https://registry.npmjs.org"
-          exch="$exch/-/npm/v1/oidc/token/exchange/package/pi-qtools"
-          curl -sS -o exch.json -w "HTTP %{http_code}\n" -X POST \
+          exch="$exch/-/npm/v1/oidc/token/exchange/package/$pkg_path"
+          code="$(curl -sS -o exch.json -w "%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $idtok" \
-            "$exch" \
-            || true
+            "$exch")"
+          echo "HTTP $code"
           head -c 800 exch.json; echo
+          if [ "$code" != "201" ]; then
+            echo "::error::npm OIDC exchange failed with HTTP $code"
+            exit 1
+          fi
+
+          npm_token="$(python3 - <<'PY'
+          import json
+          print(json.load(open("exch.json"))["token"])
+          PY
+          )"
+          echo "::add-mask::$npm_token"
+          echo "NODE_AUTH_TOKEN=$npm_token" >> "$GITHUB_ENV"
 
       - name: Publish
         if: ${{ !inputs.dry_run }}
