@@ -1,8 +1,8 @@
 name: Release
 
 # Publishes to npm via OpenID Connect trusted publishing: no NPM_TOKEN anywhere.
-# npm verifies the job's OIDC token against the trusted publisher you register at
-# npmjs.com (repo + workflow file + optional environment).
+# npm verifies the job's OIDC token against the trusted publisher you
+# register at npmjs.com (repo + workflow file + optional environment).
 #
 # Trigger by tag:   git tag v0.1.0 && git push origin v0.1.0
 # Or run manually:   Actions -> Release -> Run workflow
@@ -30,9 +30,10 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # Hardening: create an environment named `npm` in repo Settings -> Environments,
-    # uncomment below, and set the same name as the Environment field in npm's
-    # trusted-publisher form. Leave unset if you did not configure the environment.
+    # Hardening: create an environment named `npm` in repo Settings ->
+    # Environments, uncomment below, and set the same name as the
+    # Environment field in npm's trusted-publisher form. Leave unset if
+    # you did not configure the environment.
     # environment: npm
     steps:
       - uses: actions/checkout@v4
@@ -58,13 +59,18 @@ jobs:
       - name: Inspect the exact tarball that would ship
         run: npm pack --dry-run
 
-      - name: Probe the npm OIDC token exchange (diagnostic)
-        # npm's oidc.js swallows exchange failures at verbose
-        # level and then publishes unauthenticated, which the
-        # registry reports as a misleading 404. Do the same
-        # exchange by hand and print the raw response so the
-        # real reason is visible in the job log.
+      - name: Exchange OIDC token for npm publish token
+        # Do the exchange explicitly and wire the returned npm token into
+        # NODE_AUTH_TOKEN so publish never falls back to an unauthenticated
+        # request (which npm reports as a misleading 404).
         run: |
+          pkg_name="$(node -p "require('./package.json').name")"
+          pkg_path="$(python3 - "$pkg_name" <<'PY'
+          import sys, urllib.parse
+          print(urllib.parse.quote(sys.argv[1], safe=''))
+          PY
+          )"
+
           curl -sS -o idtoken.json \
             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             -H "Accept: application/json" \
@@ -88,13 +94,29 @@ jobs:
           PY
           echo "--- exchange response ---"
           exch="https://registry.npmjs.org"
-          exch="$exch/-/npm/v1/oidc/token/exchange/package/pi-qtools"
-          curl -sS -o exch.json -w "HTTP %{http_code}\n" -X POST \
+          exch="$exch/-/npm/v1/oidc/token/exchange/package/$pkg_path"
+          code="$(curl -sS -o exch.json -w "%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $idtok" \
-            "$exch" \
-            || true
-          head -c 800 exch.json; echo
+            "$exch")"
+          echo "HTTP $code"
+          # Success means "the body contains a token", exactly like
+          # npm's own client checks. Never print the body on success:
+          # that body IS the publish token and this log is public.
+          npm_token="$(python3 - <<'PY'
+          import json
+          print(json.load(open("exch.json")).get("token",""))
+          PY
+          )"
+          if [ -z "$npm_token" ]; then
+            echo "::error::npm OIDC exchange HTTP $code, no token"
+            echo "--- body (safe: contains no token) ---"
+            head -c 800 exch.json; echo
+            exit 1
+          fi
+          echo "::add-mask::$npm_token"
+          echo "exchange OK (HTTP $code); token masked"
+          echo "NODE_AUTH_TOKEN=$npm_token" >> "$GITHUB_ENV"
 
       - name: Publish
         if: ${{ !inputs.dry_run }}
