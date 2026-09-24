@@ -58,6 +58,44 @@ jobs:
       - name: Inspect the exact tarball that would ship
         run: npm pack --dry-run
 
+      - name: Probe the npm OIDC token exchange (diagnostic)
+        # npm's oidc.js swallows exchange failures at verbose
+        # level and then publishes unauthenticated, which the
+        # registry reports as a misleading 404. Do the same
+        # exchange by hand and print the raw response so the
+        # real reason is visible in the job log.
+        run: |
+          curl -sS -o idtoken.json \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            -H "Accept: application/json" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=npm:registry.npmjs.org"
+          idtok=$(python3 - <<'PY'
+          import json
+          print(json.load(open("idtoken.json"))["value"])
+          PY
+          )
+          echo "id_token acquired (${#idtok} chars)"
+          echo "--- decoded OIDC claims (what npm matches) ---"
+          python3 - "$idtok" <<'PY'
+          import base64,json,sys
+          p=sys.argv[1].split('.')[1]; p+='='*(-len(p)%4)
+          c=json.loads(base64.urlsafe_b64decode(p))
+          keys=["iss","aud","repository","repository_owner",
+                "repository_id","job_workflow_ref","ref",
+                "environment","actor"]
+          for k in keys:
+              print(f"  {k}: {c.get(k)}")
+          PY
+          echo "--- exchange response ---"
+          exch="https://registry.npmjs.org"
+          exch="$exch/-/npm/v1/oidc/token/exchange/package/pi-qtools"
+          curl -sS -o exch.json -w "HTTP %{http_code}\n" -X POST \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $idtok" \
+            "$exch" \
+            || true
+          head -c 800 exch.json; echo
+
       - name: Publish
         if: ${{ !inputs.dry_run }}
         run: npm publish --provenance --access public
