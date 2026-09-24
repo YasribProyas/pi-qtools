@@ -43,6 +43,21 @@ sends one. That is why those two capabilities are standalone tools instead.
 - `/qimage <prompt> [-m model] [-s WxH]` — saves into `out/qtools/`
 - `/qvideo <prompt> [-i <path|url>] [-m model] [-s WxH]` — `-i` selects image-to-video; saves into `out/qtools/`
 
+### Getting parameter hints
+
+pi exposes no `argumentHint` for extension commands, so `/qimage` and `/qvideo` make
+themselves discoverable three ways:
+
+1. their **signature is in the command description**, visible in the `/` picker
+2. **`--help`** (or running with no prompt) prints every flag, the allowed values, the
+   active default and the exact output path
+3. **argument completion**: after `/qimage ` or on a partial flag, suggestions list
+   `-m`/`-s`/`-i`/`--help`, and after `-m `/`-s ` they list the valid models/sizes
+
+Completions are suppressed while a prompt is being typed, because pi replaces the
+whole argument region with the chosen value — offering a flag mid-prompt would
+delete what was already written.
+
 ## Video generation schema (measured)
 
 All three models post to `/api/v1/services/aigc/video-generation/video-synthesis`
@@ -80,7 +95,8 @@ is rejected.
 
 ## Configuration
 
-Persisted to `<agentDir>/qwen-tools.json`:
+Persisted to `<agentDir>/qtools.json` (migrated automatically from the older
+`qwen-tools.json` on first load):
 
 ```json
 {
@@ -135,7 +151,7 @@ without that guard every turn would fail after a model switch.
 
 ```bash
 pi install ./path/to/qtools     # loads from this path, no copy
-pi -e ./extensions/qwen-tools.ts "prompt"   # one-off load
+pi -e ./extensions/qtools.ts "prompt"   # one-off load
 ```
 
 ## License

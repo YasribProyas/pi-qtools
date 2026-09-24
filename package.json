@@ -12,6 +12,6 @@
     "@earendil-works/pi-tui": "*"
   },
   "pi": {
-    "extensions": ["./extensions/qwen-tools.ts"]
+    "extensions": ["./extensions/qtools.ts"]
   }
 }

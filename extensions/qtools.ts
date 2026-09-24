@@ -1,5 +1,6 @@
 /**
- * qwen-tools — expose the Qwen Token Plan built-in server-side tools inside pi.
+ * pi-qtools — bridge the Qwen Token Plan into pi: built-in server-side tools plus
+ * the image / video / audio generation models that are not chat models.
  *
  * Mapped empirically against the live endpoint:
  *   https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
@@ -17,7 +18,10 @@
  *     code_interpreter_call (code+container_id+logs), web_extractor_call
  *     (urls+goal+output; requires web_search alongside).
  *
- * Config persists to <agentDir>/qwen-tools.json. UI: /qtools-config
+ *  C) native /api/v1/services/... — image + video generation. Video submits async
+ *     and returns 200 even for a malformed request, so truth comes from polling.
+ *
+ * Config persists to <agentDir>/qtools.json. UI: /qtools-config
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -25,6 +29,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getAgentDir, getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 // ------------------------------------------------------------------ capability
@@ -155,15 +160,24 @@ const TOKEN_CAPS = [4096, 8192, 16384, 32768, 65536];
 
 let config: QwenToolsConfig = { ...DEFAULTS };
 
+const CONFIG_FILE = "qtools.json";
+/** Pre-rename filename, migrated on first load. */
+const LEGACY_CONFIG_FILE = "qwen-tools.json";
+
 function configPath(): string {
-	return join(getAgentDir(), "qwen-tools.json");
+	return join(getAgentDir(), CONFIG_FILE);
 }
 
 function loadConfig(): void {
 	try {
 		const p = configPath();
-		if (!existsSync(p)) return;
-		const raw = JSON.parse(readFileSync(p, "utf8")) as Partial<QwenToolsConfig>;
+		let source = p;
+		if (!existsSync(p)) {
+			const legacy = join(getAgentDir(), LEGACY_CONFIG_FILE);
+			if (!existsSync(legacy)) return;
+			source = legacy;
+		}
+		const raw = JSON.parse(readFileSync(source, "utf8")) as Partial<QwenToolsConfig>;
 		config = {
 			...DEFAULTS,
 			...raw,
@@ -176,7 +190,11 @@ function loadConfig(): void {
 					: DEFAULTS.deepSearchMaxTokens,
 			showReasoning: typeof raw.showReasoning === "boolean" ? raw.showReasoning : DEFAULTS.showReasoning,
 			fallbackModel: typeof raw.fallbackModel === "string" && raw.fallbackModel ? raw.fallbackModel : DEFAULTS.fallbackModel,
+			imageModel: IMAGE_MODELS.includes(raw.imageModel ?? "") ? raw.imageModel! : DEFAULTS.imageModel,
+			videoModel: VIDEO_MODELS.includes(raw.videoModel ?? "") ? raw.videoModel! : DEFAULTS.videoModel,
 		};
+		// Migrate the old filename once so the new one is authoritative.
+		if (source !== p) saveConfig();
 	} catch {
 		config = { ...DEFAULTS };
 	}
@@ -731,6 +749,107 @@ async function saveMedia(ctx: ExtensionContext, url: string, model: string, sign
 	const buf = Buffer.from(await res.arrayBuffer());
 	writeFileSync(dest, buf);
 	return `${dest} (${(buf.length / 1024).toFixed(0)} KB)`;
+}
+
+/**
+ * Full parameter help for the generation commands. pi exposes no argumentHint for
+ * extension commands, so discoverability comes from three places: the signature in
+ * the command description (shown in the `/` picker), `--help`/no-args printing this
+ * block, and argument completions.
+ */
+function genUsage(kind: "image" | "video", cwd: string): string {
+	const outDir = join(cwd, "out", "qtools");
+	if (kind === "image") {
+		return [
+			"/qimage <prompt> [-m model] [-s WxH]",
+			"",
+			"  prompt   what to draw. No quotes needed: flags are stripped, the rest is the prompt.",
+			`  -m       model: ${IMAGE_MODELS.join(", ")}   (default: ${config.imageModel})`,
+			"  -s       e.g. 1024x1024. Must be 589824-16777216 total pixels (768x768 .. 4096x4096).",
+			"  --help   this text",
+			"",
+			`Writes one image to ${outDir}/<model>-<timestamp>.png`,
+			"Agent equivalent: qwen_generate_image (adds negativePrompt and save).",
+		].join("\n");
+	}
+	return [
+		"/qvideo <prompt> [-i <path|url>] [-m model] [-s WxH]",
+		"",
+		"  prompt   scene and motion.",
+		"  -i       source image to animate (min 300x300). Local paths are inlined as data URLs.",
+		`  -m       model: ${VIDEO_MODELS.join(", ")}   (default: ${config.videoModel})`,
+		"           t2v = text only, i2v = -i as first frame, r2v = -i as reference.",
+		"           Passing -i while -m is t2v switches to i2v automatically.",
+		`  -s       ${VIDEO_SIZES.join(", ")}. Advisory for i2v/r2v: output follows the source aspect ratio.`,
+		"  --help   this text",
+		"",
+		`Async task, ~90-120s. Writes to ${outDir}/<model>-<timestamp>.mp4`,
+		"Agent equivalent: qwen_generate_video (adds save).",
+	].join("\n");
+}
+
+const FLAG_MODEL = ["-m", "--model"];
+const FLAG_SIZE = ["-s", "--size"];
+const FLAG_IMAGE = ["-i", "--image", "--img"];
+
+function flagKind(tok: string | undefined): "model" | "size" | "image" | undefined {
+	if (!tok) return undefined;
+	if (FLAG_MODEL.includes(tok)) return "model";
+	if (FLAG_SIZE.includes(tok)) return "size";
+	if (FLAG_IMAGE.includes(tok)) return "image";
+	return undefined;
+}
+
+function wantsHelp(args: string): boolean {
+	const wrapped = ` ${args.trim()} `;
+	return wrapped.includes(" -h ") || wrapped.includes(" --help ") || args.trim() === "help";
+}
+
+/**
+ * Completions for /qimage and /qvideo. pi hands over the whole argument text and
+ * replaces that entire region with the chosen value, so every candidate is built as
+ * "<already typed> <completion>". Returns null while the user is typing a prompt,
+ * otherwise picking a suggestion would silently delete what they wrote.
+ */
+function genCompletions(prefix: string, opts: { models: string[]; sizes: string[]; image: boolean }): AutocompleteItem[] | null {
+	const trimmed = prefix.replace(/\s+$/, "");
+	const toks = trimmed.length ? trimmed.split(/\s+/) : [];
+	const last = toks[toks.length - 1];
+	const lastIsFlag = flagKind(last);
+	const kind = lastIsFlag ?? flagKind(toks[toks.length - 2]);
+	const head = lastIsFlag ? toks.slice(0, -1) : flagKind(toks[toks.length - 2]) ? toks.slice(0, -2) : null;
+
+	if (kind && head) {
+		if (kind === "image") return null; // filesystem paths: nothing safe to suggest
+		const partial = lastIsFlag ? "" : (last ?? "");
+		const pool = kind === "model" ? opts.models : opts.sizes;
+		const items = pool
+			.filter((v) => v.startsWith(partial))
+			.map((v) => ({
+				value: [...head, v].join(" ") + " ",
+				label: v,
+				description: kind === "model" ? "model" : "resolution",
+			}));
+		return items.length ? items : null;
+	}
+
+	if (toks.length === 0 || (last && last.startsWith("-"))) {
+		const flagPrefix = last && last.startsWith("-") ? last : "";
+		const keep = last && last.startsWith("-") ? toks.slice(0, -1) : toks;
+		const cands: AutocompleteItem[] = [];
+		if (opts.image) cands.push({ value: "-i ", label: "-i", description: "source image path/url -> image-to-video" });
+		cands.push(
+			{ value: "-m ", label: "-m", description: "model" },
+			{ value: "-s ", label: "-s", description: "size" },
+			{ value: "--help", label: "--help", description: "show all parameters" },
+		);
+		const items = cands
+			.filter((c) => c.label.startsWith(flagPrefix))
+			.map((c) => ({ ...c, value: `${keep.length ? keep.join(" ") + " " : ""}${c.value}`.replace(/\s+/g, " ") }));
+		return items.length ? items : null;
+	}
+
+	return null;
 }
 
 function parseGenArgs(
@@ -1303,11 +1422,16 @@ export default function (pi: ExtensionAPI): void {
 
 	// ---------------------------------------------------------------- commands
 	pi.registerCommand("qimage", {
-		description: `Generate an image (default model: ${config.imageModel})`,
+		description: `Generate an image — /qimage <prompt> [-m model] [-s WxH] (default: ${config.imageModel})`,
+		getArgumentCompletions: (prefix) => genCompletions(prefix, { models: IMAGE_MODELS, sizes: [], image: false }),
 		handler: async (args, ctx) => {
+			if (wantsHelp(args)) {
+				ctx.ui.notify(genUsage("image", ctx.cwd), "info");
+				return;
+			}
 			const { prompt, model, size } = parseGenArgs(args, IMAGE_MODELS);
 			if (!prompt) {
-				ctx.ui.notify("Usage: /qimage <prompt> [-m model] [-s WxH]", "error");
+				ctx.ui.notify(genUsage("image", ctx.cwd), "error");
 				return;
 			}
 			ctx.ui.notify(`Generating image with ${model || config.imageModel}...`, "info");
@@ -1324,11 +1448,16 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("qvideo", {
-		description: `Generate a video, blocking (default model: ${config.videoModel})`,
+		description: `Generate a video — /qvideo <prompt> [-i img] [-m model] [-s WxH] (default: ${config.videoModel})`,
+		getArgumentCompletions: (prefix) => genCompletions(prefix, { models: VIDEO_MODELS, sizes: VIDEO_SIZES, image: true }),
 		handler: async (args, ctx) => {
+			if (wantsHelp(args)) {
+				ctx.ui.notify(genUsage("video", ctx.cwd), "info");
+				return;
+			}
 			const { prompt, model, size, image } = parseGenArgs(args, VIDEO_MODELS);
 			if (!prompt) {
-				ctx.ui.notify("Usage: /qvideo <prompt> [-i <path|url>] [-m model] [-s WxH]", "error");
+				ctx.ui.notify(genUsage("video", ctx.cwd), "error");
 				return;
 			}
 			const r = await generateVideo(ctx, {
