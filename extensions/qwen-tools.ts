@@ -293,20 +293,36 @@ function parseImageCall(o: any): { text: string; urls: string[] } {
 }
 
 /** Accept an http(s)/data URL directly, or inline a local file as a data URL. */
-function toImagePart(image: string): { type: "input_image"; image_url: string } {
-	if (/^(https?:|data:)/i.test(image)) return { type: "input_image", image_url: image };
+/**
+ * Resolve an image reference to something the Qwen APIs accept: an http(s) URL or
+ * data: URL is passed through, a local path is inlined as a base64 data URL.
+ *
+ * Measured bound: a 5.0 MB PNG (6.7 MB of base64) submitted to happyhorse-1.1-i2v
+ * reached SUCCEEDED. The ceiling above that is unknown, so this limit is a guard
+ * rail with headroom rather than a verified maximum; no local transcoder is assumed
+ * available, so the message tells the user to host the file instead.
+ */
+const MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024;
+
+function toImageUrl(image: string, maxBytes = MAX_INLINE_IMAGE_BYTES): string {
+	if (/^(https?:|data:)/i.test(image)) return image;
 	const path = image.replace(/^file:\/\//, "");
 	if (!existsSync(path)) {
 		throw new Error(`Image not found: ${image}. Pass an http(s) URL, a data: URL, or a local file path.`);
 	}
 	const buf = readFileSync(path);
-	const MB = 1024 * 1024;
-	if (buf.length > 4 * MB) {
-		throw new Error(`Local image is ${(buf.length / MB).toFixed(1)} MB; the inline data-URL limit here is 4 MB. Use a URL instead.`);
+	if (buf.length > maxBytes) {
+		throw new Error(
+			`Local image is ${(buf.length / (1024 * 1024)).toFixed(1)} MB, above the ${(maxBytes / (1024 * 1024)).toFixed(0)} MB inline limit (verified to 5.0 MB). Upload it and pass the URL, or point -i at a smaller file.`,
+		);
 	}
 	const ext = (path.split(".").pop() ?? "png").toLowerCase();
 	const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : `image/${ext}`;
-	return { type: "input_image", image_url: `data:${mime};base64,${buf.toString("base64")}` };
+	return `data:${mime};base64,${buf.toString("base64")}`;
+}
+
+function toImagePart(image: string): { type: "input_image"; image_url: string } {
+	return { type: "input_image", image_url: toImageUrl(image) };
 }
 
 async function responsesCall(
@@ -511,6 +527,27 @@ async function agentModeCall(
 const MG_PATH = "/api/v1/services/aigc/multimodal-generation/generation";
 const VIDEO_PATH = "/api/v1/services/aigc/video-generation/video-synthesis";
 
+/**
+ * Native endpoints hang off the host root, while the configured baseUrl ends in
+ * /compatible-mode/v1. Fall back to the known plan host if a provider ever hands
+ * us something unparseable rather than throwing out of every generation call.
+ */
+function originOf(baseUrl: string, provider: string): string {
+	try {
+		return new URL(baseUrl).origin;
+	} catch {
+		const fallback = BASE_URLS[provider];
+		if (fallback) {
+			try {
+				return new URL(fallback).origin;
+			} catch {
+				/* fall through */
+			}
+		}
+		return "https://token-plan.ap-southeast-1.maas.aliyuncs.com";
+	}
+}
+
 interface NativeResponse {
 	status: number;
 	body: any;
@@ -523,8 +560,7 @@ async function nativeCall(
 	options?: { async?: boolean; signal?: AbortSignal; timeoutMs?: number },
 ): Promise<NativeResponse> {
 	const { baseUrl, apiKey } = await resolveEndpoint(ctx);
-	// baseUrl ends in /compatible-mode/v1; the native API hangs off the host root.
-	const origin = new URL(baseUrl).origin;
+	const origin = originOf(baseUrl, resolveProvider(ctx));
 	const res = await fetch(`${origin}${path}`, {
 		method: "POST",
 		signal: options?.signal,
@@ -555,7 +591,7 @@ async function pollTask(
 	options?: { signal?: AbortSignal; onTick?: (status: string, elapsedS: number) => void; timeoutMs?: number },
 ): Promise<any> {
 	const { baseUrl, apiKey } = await resolveEndpoint(ctx);
-	const origin = new URL(baseUrl).origin;
+	const origin = originOf(baseUrl, resolveProvider(ctx));
 	const deadline = Date.now() + (options?.timeoutMs ?? 10 * 60 * 1000);
 	let attempt = 0;
 	while (Date.now() < deadline) {
@@ -603,18 +639,65 @@ async function generateImage(
 	return { model, urls: extractImageUrls(r.body), raw: r.body };
 }
 
+/**
+ * Which `input.media[].type` each video model requires. Measured by reading the
+ * validation errors: i2v wants exactly "first_frame", r2v exactly "reference_image",
+ * and t2v takes no image at all. Anything else fails with
+ * "Input should be 'first_frame': input.media.0.type".
+ */
+const VIDEO_MEDIA_TYPE: Record<string, string | undefined> = {
+	"happyhorse-1.1-t2v": undefined,
+	"happyhorse-1.1-i2v": "first_frame",
+	"happyhorse-1.1-r2v": "reference_image",
+};
+
+interface VideoResult {
+	model: string;
+	taskId: string;
+	status: string;
+	url?: string;
+	/** Task-level failure text. Submits always return 200, so this is the only place a bad request shows up. */
+	detail?: string;
+	usedImage?: string;
+}
+
 /** Shared core for /qvideo and qwen_generate_video. Blocks on task polling. */
 async function generateVideo(
 	ctx: ExtensionContext,
-	opts: { prompt: string; model?: string; size?: string; signal?: AbortSignal; onTick?: (s: string, sec: number) => void },
-): Promise<{ model: string; taskId: string; status: string; url?: string }> {
-	const model = opts.model && VIDEO_MODELS.includes(opts.model) ? opts.model : config.videoModel;
+	opts: {
+		prompt: string;
+		model?: string;
+		size?: string;
+		image?: string;
+		signal?: AbortSignal;
+		onTick?: (s: string, sec: number) => void;
+	},
+): Promise<VideoResult> {
+	const hasImage = Boolean(opts.image?.trim());
+	let model = opts.model && VIDEO_MODELS.includes(opts.model) ? opts.model : config.videoModel;
+	// Passing an image to the text-only model is intent, not a mistake: switch to i2v.
+	if (hasImage && !VIDEO_MEDIA_TYPE[model]) model = "happyhorse-1.1-i2v";
+	const mediaType = VIDEO_MEDIA_TYPE[model];
+	if (!hasImage && mediaType) {
+		throw new Error(
+			`${model} requires an image (tool parameter "image", or /qvideo -i <path|url>). Use happyhorse-1.1-t2v for text-only video.`,
+		);
+	}
+
+	const input: Record<string, unknown> = { prompt: opts.prompt };
+	let usedImage: string | undefined;
+	if (hasImage && mediaType) {
+		const url = toImageUrl(opts.image!.trim());
+		input.media = [{ type: mediaType, url }];
+		usedImage = url.startsWith("data:") ? `inline image (${Math.round(url.length / 1024)} KB base64)` : url;
+	}
+
 	const submit = await nativeCall(
 		ctx,
 		VIDEO_PATH,
 		{
 			model,
-			input: { prompt: opts.prompt },
+			input,
 			parameters: { size: opts.size && VIDEO_SIZES.includes(opts.size) ? opts.size : VIDEO_SIZES[0] },
 		},
 		{ async: true, signal: opts.signal },
@@ -622,10 +705,16 @@ async function generateVideo(
 	const taskId = submit.body?.output?.task_id;
 	if (!taskId) throw new Error(`No task_id returned: ${JSON.stringify(submit.body).slice(0, 300)}`);
 	const out = await pollTask(ctx, taskId, { signal: opts.signal, onTick: opts.onTick });
-	return { model, taskId, status: out?.task_status ?? "UNKNOWN", url: out?.video_url };
+	return {
+		model,
+		taskId,
+		status: out?.task_status ?? "UNKNOWN",
+		url: out?.video_url,
+		detail: out?.message ?? out?.code,
+		usedImage,
+	};
 }
 
-/** Parse `/qimage a cat -m wan2.7-image-pro -s 1024*1024` style args. */
 /**
  * Download a hosted media URL into <cwd>/out/qtools/. The commands do this because
  * these signed OSS URLs are long enough to wrap across terminal rows, so copying one
@@ -644,11 +733,15 @@ async function saveMedia(ctx: ExtensionContext, url: string, model: string, sign
 	return `${dest} (${(buf.length / 1024).toFixed(0)} KB)`;
 }
 
-function parseGenArgs(args: string, models: string[]): { prompt: string; model?: string; size?: string } {
+function parseGenArgs(
+	args: string,
+	models: string[],
+): { prompt: string; model?: string; size?: string; image?: string } {
 	const tokens = args.trim().split(/\s+/);
 	const parts: string[] = [];
 	let model: string | undefined;
 	let size: string | undefined;
+	let image: string | undefined;
 	for (let i = 0; i < tokens.length; i++) {
 		const t = tokens[i];
 		if ((t === "-m" || t === "--model") && tokens[i + 1]) {
@@ -657,11 +750,13 @@ function parseGenArgs(args: string, models: string[]): { prompt: string; model?:
 			if (!model) parts.push(m); // not a known model: treat as prompt text
 		} else if ((t === "-s" || t === "--size") && tokens[i + 1]) {
 			size = tokens[++i].replace(/[x×]/g, "*");
+		} else if ((t === "-i" || t === "--image" || t === "--img") && tokens[i + 1]) {
+			image = tokens[++i];
 		} else {
 			parts.push(t);
 		}
 	}
-	return { prompt: parts.join(" ").trim(), model, size };
+	return { prompt: parts.join(" ").trim(), model, size, image };
 }
 
 function formatUrls(label: string, model: string, urls: string[]): string {
@@ -766,7 +861,7 @@ function descriptionFor(id: string, ctx: ExtensionContext): string {
 		case "imageModel":
 			return `Default for qwen_generate_image and /qimage. All three verified working via the native multimodal-generation endpoint.`;
 		case "videoModel":
-			return `Default for qwen_generate_video and /qvideo. t2v verified end to end (~96s for 720p). i2v/r2v need an extra input.`;
+			return `Default for qwen_generate_video and /qvideo. t2v animates text; i2v animates a starting frame (media type first_frame); r2v takes a reference image (reference_image). All video is async and takes ~90-120s.`;
 		case "typemap":
 			return "Console capability labels differ from the API tools[].type strings. Sending a label is silently ignored.";
 		case "provider":
@@ -843,7 +938,9 @@ function buildItems(ctx: ExtensionContext, th: ThemeLike): SettingItem[] {
 					VIDEO_MODELS.map((m) => ({
 						value: m,
 						label: m,
-						description: m.endsWith("t2v") ? "text -> video (verified end to end)" : "needs an extra image/reference input",
+						description: VIDEO_MEDIA_TYPE[m]
+							? `needs -i / "image"; media type "${VIDEO_MEDIA_TYPE[m]}" (min 300x300)`
+							: "text -> video, no image needed",
 					})),
 					current,
 					(v) => done(v),
@@ -1136,15 +1233,21 @@ export default function (pi: ExtensionAPI): void {
 			prompt: Type.String({ description: "What to draw." }),
 			model: Type.Optional(Type.String({ description: `Override model. One of: ${IMAGE_MODELS.join(", ")}.` })),
 			negativePrompt: Type.Optional(Type.String({ description: "What to avoid." })),
-			size: Type.Optional(Type.String({ description: "Pixel size, e.g. 1024*1024." })),
+			size: Type.Optional(Type.String({ description: "Pixel size, e.g. 1024*1024. Must be 589824-16777216 total pixels (768² to 4096²)." })),
+			save: Type.Optional(Type.Boolean({ description: "Also write the images into <cwd>/out/qtools/ instead of only returning expiring URLs." })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			onUpdate?.({ content: [{ type: "text", text: "generating image..." }] });
 			const r = await generateImage(ctx, { ...params, signal });
-			const text = r.urls.length
+			let text = r.urls.length
 				? formatUrls("Generated images", r.model, r.urls)
 				: `No image URL returned by ${r.model}:\n${JSON.stringify(r.raw).slice(0, 600)}`;
-			return { content: [{ type: "text", text }], details: { model: r.model, urls: r.urls } };
+			let files: string[] = [];
+			if (params.save && r.urls.length) {
+				files = await Promise.all(r.urls.map((u) => saveMedia(ctx, u, r.model, signal)));
+				text += `\n\nSaved:\n${files.map((f) => `  ${f}`).join("\n")}`;
+			}
+			return { content: [{ type: "text", text }], details: { model: r.model, urls: r.urls, files } };
 		},
 	});
 
@@ -1153,20 +1256,31 @@ export default function (pi: ExtensionAPI): void {
 		name: "qwen_generate_video",
 		label: "Qwen Video Generation",
 		description:
-			"Generate a short video from text with the plan's HappyHorse models, using the async task API " +
-			"(submit then poll). Blocks until the task finishes, which took ~96s for a 720p clip in testing. " +
-			"happyhorse-1.1-t2v is verified end to end; i2v/r2v need an extra image input this tool does not send yet.",
-		promptSnippet: "Generate a short video from a text prompt (slow)",
+			"Generate a short video with the plan's HappyHorse models using the async task API (submit then poll). " +
+			"Blocks until the task finishes, which took ~90-120s in testing. t2v animates from a text prompt; " +
+			"i2v animates from a starting frame and r2v from a reference image, so pass the `image` parameter for those " +
+			"(http(s) URL, data: URL, or local file path). Passing an image to t2v switches it to i2v automatically. " +
+			"Note the endpoint returns HTTP 200 on submit even for a malformed request, so failures only appear in the " +
+			"polled result; read the returned status rather than assuming success.",
+		promptSnippet: "Generate a short video from text or a source image (slow)",
 		promptGuidelines: [
 			"Use qwen_generate_video only when the user explicitly asks for generated video, and warn them it takes a couple of minutes since it blocks.",
+			"For animating an existing picture, pass qwen_generate_video the image parameter; happyhorse-1.1-i2v needs at least a 300x300 source image.",
 		],
 		parameters: Type.Object({
 			prompt: Type.String({ description: "Scene and motion description." }),
+			image: Type.Optional(
+				Type.String({
+					description:
+						"Source image for i2v (first frame) or r2v (reference). http(s) URL, data: URL, or local file path. Min 300x300.",
+				}),
+			),
 			model: Type.Optional(Type.String({ description: `Override model. One of: ${VIDEO_MODELS.join(", ")}.` })),
-			size: Type.Optional(Type.String({ description: `One of: ${VIDEO_SIZES.join(", ")}.` })),
+			size: Type.Optional(Type.String({ description: `One of: ${VIDEO_SIZES.join(", ")}. Advisory only for i2v/r2v: output follows the source image aspect ratio (a square frame returned 1440x1440).` })),
+			save: Type.Optional(Type.Boolean({ description: "Also write the clip into <cwd>/out/qtools/ instead of only returning an expiring URL." })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
-			onUpdate?.({ content: [{ type: "text", text: "submitting video task..." }] });
+			onUpdate?.({ content: [{ type: "text", text: params.image ? "submitting image-to-video task..." : "submitting video task..." }] });
 			const r = await generateVideo(ctx, {
 				...params,
 				signal,
@@ -1175,8 +1289,15 @@ export default function (pi: ExtensionAPI): void {
 			const text =
 				r.status === "SUCCEEDED"
 					? formatUrls("Generated video", r.model, r.url ? [r.url] : []) + `\n(task ${r.taskId})`
-					: `Video task ${r.status} (task ${r.taskId})`;
-			return { content: [{ type: "text", text }], details: r };
+					: `Video task ${r.status} (task ${r.taskId})${r.detail ? `\n  ${r.detail}` : ""}`;
+			let file: string | undefined;
+			if (params.save && r.status === "SUCCEEDED" && r.url) {
+				file = await saveMedia(ctx, r.url, r.model, signal).catch((e) => `save failed: ${e.message}`);
+			}
+			return {
+				content: [{ type: "text", text: file ? `${text}\n\nSaved:\n  ${file}` : text }],
+				details: { ...r, file },
+			};
 		},
 	});
 
@@ -1205,24 +1326,27 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("qvideo", {
 		description: `Generate a video, blocking (default model: ${config.videoModel})`,
 		handler: async (args, ctx) => {
-			const { prompt, model, size } = parseGenArgs(args, VIDEO_MODELS);
+			const { prompt, model, size, image } = parseGenArgs(args, VIDEO_MODELS);
 			if (!prompt) {
-				ctx.ui.notify("Usage: /qvideo <prompt> [-m model] [-s WxH]", "error");
+				ctx.ui.notify("Usage: /qvideo <prompt> [-i <path|url>] [-m model] [-s WxH]", "error");
 				return;
 			}
-			const stop = ctx.ui.setWorkingMessage?.("Submitting video task (takes ~1-3 min)...");
 			const r = await generateVideo(ctx, {
 				prompt,
 				model,
 				size,
+				image,
 				onTick: (st) => ctx.ui.notify(`video ${st}`, "info"),
 			});
-			void stop;
 			if (r.status === "SUCCEEDED" && r.url) {
 				const saved = await saveMedia(ctx, r.url, r.model).catch((e) => `save failed: ${e.message}`);
 				ctx.ui.notify(`Video from ${r.model}:\n  ${saved}`, "success");
 			} else {
-				ctx.ui.notify(`Video task ${r.status} (task ${r.taskId})`, "error");
+				// Submits always 200, so the polled detail is the only real error signal.
+				ctx.ui.notify(
+					`Video task ${r.status} (task ${r.taskId})${r.detail ? `\n  ${r.detail}` : ""}`,
+					"error",
+				);
 			}
 		},
 	});
