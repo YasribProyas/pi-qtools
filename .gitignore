@@ -8,3 +8,5 @@ out/
 out/
 *.mp4
 *.png.generated
+
+scripts-resync-session.sh
