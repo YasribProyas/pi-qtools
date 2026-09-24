@@ -1,0 +1,67 @@
+name: Release
+
+# Publishes to npm via OpenID Connect trusted publishing: no NPM_TOKEN anywhere.
+# npm verifies the job's OIDC token against the trusted publisher you register at
+# npmjs.com (repo + workflow file + optional environment).
+#
+# Trigger by tag:   git tag v0.1.0 && git push origin v0.1.0
+# Or run manually:   Actions -> Release -> Run workflow
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run npm publish --dry-run only (no upload)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  # The one permission that makes OIDC publishing possible.
+  id-token: write
+
+# Two publishes at once could race on the registry.
+concurrency:
+  group: npm-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Hardening: create an environment named `npm` in repo Settings -> Environments,
+    # uncomment below, and set the same name as the Environment field in npm's
+    # trusted-publisher form. Leave unset if you did not configure the environment.
+    # environment: npm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          # Deliberately no `token:` — with trusted publishing the registry
+          # identity comes from the OIDC assertion, not a stored credential.
+
+      - name: Check that the tag matches package.json version
+        if: github.event_name == 'push'
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+          echo "publishing pi-qtools@$pkg"
+
+      - name: Inspect the exact tarball that would ship
+        run: npm pack --dry-run
+
+      - name: Publish
+        if: ${{ !inputs.dry_run }}
+        run: npm publish --provenance --access public
+
+      - name: Dry run only
+        if: ${{ inputs.dry_run }}
+        run: npm publish --dry-run
