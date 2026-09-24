@@ -6,8 +6,7 @@
   "keywords": ["pi-package", "pi", "pi-coding-agent", "qwen", "dashscope", "web-search", "web-scraping", "code-interpreter", "image-search", "image-generation", "video-generation"],
   "license": "MIT",
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "author": "Yasrib Proyas",
   "homepage": "https://github.com/YasribProyas/pi-qtools#readme",
