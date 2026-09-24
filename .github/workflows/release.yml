@@ -1,8 +1,8 @@
 name: Release
 
 # Publishes to npm via OpenID Connect trusted publishing: no NPM_TOKEN anywhere.
-# npm verifies the job's OIDC token against the trusted publisher you register at
-# npmjs.com (repo + workflow file + optional environment).
+# npm verifies the job's OIDC token against the trusted publisher you
+# register at npmjs.com (repo + workflow file + optional environment).
 #
 # Trigger by tag:   git tag v0.1.0 && git push origin v0.1.0
 # Or run manually:   Actions -> Release -> Run workflow
@@ -30,9 +30,10 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # Hardening: create an environment named `npm` in repo Settings -> Environments,
-    # uncomment below, and set the same name as the Environment field in npm's
-    # trusted-publisher form. Leave unset if you did not configure the environment.
+    # Hardening: create an environment named `npm` in repo Settings ->
+    # Environments, uncomment below, and set the same name as the
+    # Environment field in npm's trusted-publisher form. Leave unset if
+    # you did not configure the environment.
     # environment: npm
     steps:
       - uses: actions/checkout@v4
@@ -99,18 +100,22 @@ jobs:
             -H "Authorization: Bearer $idtok" \
             "$exch")"
           echo "HTTP $code"
-          head -c 800 exch.json; echo
-          if [ "$code" != "201" ]; then
-            echo "::error::npm OIDC exchange failed with HTTP $code"
-            exit 1
-          fi
-
+          # Success means "the body contains a token", exactly like
+          # npm's own client checks. Never print the body on success:
+          # that body IS the publish token and this log is public.
           npm_token="$(python3 - <<'PY'
           import json
-          print(json.load(open("exch.json"))["token"])
+          print(json.load(open("exch.json")).get("token",""))
           PY
           )"
+          if [ -z "$npm_token" ]; then
+            echo "::error::npm OIDC exchange HTTP $code, no token"
+            echo "--- body (safe: contains no token) ---"
+            head -c 800 exch.json; echo
+            exit 1
+          fi
           echo "::add-mask::$npm_token"
+          echo "exchange OK (HTTP $code); token masked"
           echo "NODE_AUTH_TOKEN=$npm_token" >> "$GITHUB_ENV"
 
       - name: Publish
