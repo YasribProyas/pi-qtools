@@ -19,7 +19,7 @@ Requires a `qwen-token-plan*` provider authenticated in pi (`/login`).
 | `qwen_image_search` | `/responses` `web_search_image` | text → image URLs. **qwen3.8-max only** |
 | `qwen_reverse_image_search` | `/responses` `image_search` | image URL or local file → similar images; accepts a local path and inlines it as a data URL (4 MB cap) |
 | `qwen_deep_search` | chat `search_strategy: "agent"` | multi-step research; very expensive (~340k prompt tokens observed) |
-| `qwen_generate_image` | native `multimodal-generation` | `wan2.7-image`, `wan2.7-image-pro`, `qwen-image-3.0-pro`; sync; `save: true` writes into `<cwd>/out/qtools/` |
+| `qwen_generate_image` | native `multimodal-generation` | `wan2.7-image`, `wan2.7-image-pro`, `qwen-image-3.0-pro`; sync; `image` edits a reference picture; `save: true` writes into `<cwd>/out/qtools/` |
 | `qwen_generate_video` | native `video-generation` + task polling | `happyhorse-1.1-t2v` / `-i2v` / `-r2v`; async, ~90-120s; `save: true` writes the mp4 |
 
 ## Passive main-loop search
@@ -40,10 +40,31 @@ sends one. That is why those two capabilities are standalone tools instead.
 ## Commands
 
 - `/qtools-config` — settings TUI (search mode, model defaults, capability matrix)
-- `/qimage <prompt> [-m model] [-s WxH]` — saves into `out/qtools/`
+- `/qimage <prompt> [-i img] [-m model] [-s WxH]` — saves into `out/qtools/`
 - `/qvideo <prompt> [-i <path|url>] [-m model] [-s WxH]` — `-i` selects image-to-video; saves into `out/qtools/`
 
-### Getting parameter hints
+### Image editing (measured)
+
+Passing a reference image turns the same endpoint from text-to-image into
+image+prompt editing. The shape is one extra content part:
+
+```json
+{ "input": { "messages": [ { "role": "user", "content": [
+  { "image": "https://... or data:image/png;base64,..." },
+  { "text": "turn this into a red panda, keep the flat vector style" }
+] } ] } }
+```
+
+Verified: a flat-vector pig + that prompt came back a red panda **in the same
+style**, and a local file inlined as a data URL worked too. Two reference images
+in one message are accepted.
+
+The trap here is that a wrong request shape still returns a valid image, just
+generated from the text alone. Every claim above was checked by asking a vision
+model (`qwen3.8-max`, which has real image input on this plan) to describe the
+output, not by trusting the HTTP 200.
+
+## Getting parameter hints
 
 pi exposes no `argumentHint` for extension commands, so `/qimage` and `/qvideo` make
 themselves discoverable three ways:

@@ -643,18 +643,40 @@ function extractImageUrls(body: any): string[] {
 /** Shared core so the tool and the /qimage command behave identically. */
 async function generateImage(
 	ctx: ExtensionContext,
-	opts: { prompt: string; model?: string; negativePrompt?: string; size?: string; signal?: AbortSignal },
-): Promise<{ model: string; urls: string[]; raw: unknown }> {
+	opts: {
+		prompt: string;
+		model?: string;
+		negativePrompt?: string;
+		size?: string;
+		/** Reference image to edit: local path, http(s) URL, or data: URL. */
+		image?: string;
+		signal?: AbortSignal;
+	},
+): Promise<{ model: string; urls: string[]; raw: unknown; edited?: string }> {
 	const model = opts.model && IMAGE_MODELS.includes(opts.model) ? opts.model : config.imageModel;
 	const parameters: Record<string, unknown> = { result_format: "message" };
 	if (opts.size) parameters.size = opts.size;
 	if (opts.negativePrompt) parameters.negative_prompt = opts.negativePrompt;
+
+	// Verified shape: an extra {image} content part next to the text switches this
+	// endpoint from text-to-image to image+prompt editing. Confirmed by vision:
+	// a flat-vector pig + "turn this into a red panda" came back a red panda in the
+	// same style, and a local file inlined as a data URL worked too.
+	const content: Array<Record<string, unknown>> = [];
+	let edited: string | undefined;
+	if (opts.image?.trim()) {
+		const ref = toImageUrl(opts.image.trim());
+		content.push({ image: ref });
+		edited = ref.startsWith("data:") ? `inline image (${Math.round(ref.length / 1024)} KB base64)` : ref;
+	}
+	content.push({ text: opts.prompt });
+
 	const r = await nativeCall(ctx, MG_PATH, {
 		model,
-		input: { messages: [{ role: "user", content: [{ text: opts.prompt }] }] },
+		input: { messages: [{ role: "user", content }] },
 		parameters,
 	}, { signal: opts.signal });
-	return { model, urls: extractImageUrls(r.body), raw: r.body };
+	return { model, urls: extractImageUrls(r.body), raw: r.body, edited };
 }
 
 /**
@@ -761,9 +783,11 @@ function genUsage(kind: "image" | "video", cwd: string): string {
 	const outDir = join(cwd, "out", "qtools");
 	if (kind === "image") {
 		return [
-			"/qimage <prompt> [-m model] [-s WxH]",
+			"/qimage <prompt> [-i img] [-m model] [-s WxH]",
 			"",
 			"  prompt   what to draw. No quotes needed: flags are stripped, the rest is the prompt.",
+			"  -i       reference image to edit (local path, http(s) or data URL).",
+			"           With -i this is image+prompt editing, not text-to-image.",
 			`  -m       model: ${IMAGE_MODELS.join(", ")}   (default: ${config.imageModel})`,
 			"  -s       e.g. 1024x1024. Must be 589824-16777216 total pixels (768x768 .. 4096x4096).",
 			"  --help   this text",
@@ -1342,14 +1366,23 @@ export default function (pi: ExtensionAPI): void {
 		description:
 			"Generate images with the Qwen plan's image models (wan2.7-image, wan2.7-image-pro, qwen-image-3.0-pro) " +
 			"through the native multimodal-generation endpoint. These are not chat models, so they are unreachable " +
-			"from pi's normal model list. Returns temporary hosted image URLs.",
-		promptSnippet: "Generate images with Qwen/Wan image models",
+			"from pi's normal model list. Pass `image` to edit an existing picture instead of drawing from scratch: " +
+			"the reference plus the prompt produce a new image that keeps the source's style and subject layout. " +
+			"Returns temporary hosted image URLs.",
+		promptSnippet: "Generate or edit images with Qwen/Wan image models",
 		promptGuidelines: [
 			"Use qwen_generate_image when the user asks to create or draw an image; report the returned URLs as links and note they are temporary hosted files.",
+			"Use qwen_generate_image with the image parameter when the user wants an existing picture restyled, edited, or used as a reference.",
 			"qwen_generate_image cannot render images in the terminal, so hand the user the URL rather than describing pixels you cannot see.",
 		],
 		parameters: Type.Object({
-			prompt: Type.String({ description: "What to draw." }),
+			prompt: Type.String({ description: "What to draw, or how to change the reference image." }),
+			image: Type.Optional(
+				Type.String({
+					description:
+						"Reference image to edit: http(s) URL, data: URL, or local file path. Omit for text-to-image.",
+				}),
+			),
 			model: Type.Optional(Type.String({ description: `Override model. One of: ${IMAGE_MODELS.join(", ")}.` })),
 			negativePrompt: Type.Optional(Type.String({ description: "What to avoid." })),
 			size: Type.Optional(Type.String({ description: "Pixel size, e.g. 1024*1024. Must be 589824-16777216 total pixels (768² to 4096²)." })),
@@ -1366,7 +1399,7 @@ export default function (pi: ExtensionAPI): void {
 				files = await Promise.all(r.urls.map((u) => saveMedia(ctx, u, r.model, signal)));
 				text += `\n\nSaved:\n${files.map((f) => `  ${f}`).join("\n")}`;
 			}
-			return { content: [{ type: "text", text }], details: { model: r.model, urls: r.urls, files } };
+			return { content: [{ type: "text", text }], details: { model: r.model, urls: r.urls, files, edited: r.edited } };
 		},
 	});
 
@@ -1422,20 +1455,20 @@ export default function (pi: ExtensionAPI): void {
 
 	// ---------------------------------------------------------------- commands
 	pi.registerCommand("qimage", {
-		description: `Generate an image — /qimage <prompt> [-m model] [-s WxH] (default: ${config.imageModel})`,
-		getArgumentCompletions: (prefix) => genCompletions(prefix, { models: IMAGE_MODELS, sizes: [], image: false }),
+		description: `Generate or edit an image — /qimage <prompt> [-i img] [-m model] [-s WxH]`,
+		getArgumentCompletions: (prefix) => genCompletions(prefix, { models: IMAGE_MODELS, sizes: [], image: true }),
 		handler: async (args, ctx) => {
 			if (wantsHelp(args)) {
 				ctx.ui.notify(genUsage("image", ctx.cwd), "info");
 				return;
 			}
-			const { prompt, model, size } = parseGenArgs(args, IMAGE_MODELS);
+			const { prompt, model, size, image } = parseGenArgs(args, IMAGE_MODELS);
 			if (!prompt) {
 				ctx.ui.notify(genUsage("image", ctx.cwd), "error");
 				return;
 			}
-			ctx.ui.notify(`Generating image with ${model || config.imageModel}...`, "info");
-			const r = await generateImage(ctx, { prompt, model, size });
+			ctx.ui.notify(`${image ? "Editing" : "Generating"} image with ${model || config.imageModel}...`, "info");
+			const r = await generateImage(ctx, { prompt, model, size, image });
 			if (!r.urls.length) {
 				ctx.ui.notify(`No image URL from ${r.model}`, "error");
 				return;
