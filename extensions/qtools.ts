@@ -75,21 +75,36 @@ const IMG = (wsi: boolean, is: boolean) => res(true, true, true, wsi, is);
 const NO_RES = res(false, false, false, false, false);
 
 /**
- * Measured per model. The two image tools are gated separately from each other:
- * `web_search_image` is qwen3.8-max only, while `image_search` also works on
- * qwen3.8-flash / 3.7-plus / 3.6-flash. Untested cells are left false.
+ * Measured per model. The two image tools are gated separately from each other.
+ * Re-measured 2026-10-10: `web_search_image` is NOT qwen3.8-max-only as this table
+ * first claimed, it also runs on qwen3.8-flash / 3.7-plus / 3.6-flash. That mistake is
+ * what forced every image-tool fallback onto the max tier, which bills several times a
+ * flash tier on this plan. Untested cells are left false.
  */
 const CAPS: Record<string, Caps> = {
 	"qwen3.8-max": { chat: chat(true, false, false), responses: ALL_RES },
-	"qwen3.8-flash": { chat: chat(true, false, false), responses: IMG(false, true) },
+	"qwen3.8-flash": { chat: chat(true, false, false), responses: IMG(true, true) },
 	"qwen3.7-max": { chat: chat(true, true, true), responses: IMG(false, false) },
-	"qwen3.7-plus": { chat: chat(true, true, true), responses: IMG(false, true) },
-	"qwen3.6-flash": { chat: chat(true, true, true), responses: IMG(false, true) },
+	"qwen3.7-plus": { chat: chat(true, true, true), responses: IMG(true, true) },
+	"qwen3.6-flash": { chat: chat(true, true, true), responses: IMG(true, true) },
 	"deepseek-v4-pro": { chat: chat(true, true, true), responses: IMG(false, false) },
 	"deepseek-v4-pro-0813": { chat: chat(true, true, true), responses: IMG(false, false) },
 	"deepseek-v4-flash": { chat: chat(true, true, true), responses: IMG(false, false) },
 	"deepseek-v4-flash-0731": { chat: chat(true, true, true), responses: IMG(false, false) },
 	"glm-5.2": { chat: chat(false, false, false), responses: IMG(false, false) },
+	// Measured 2026-10-10: chat enable_search -> 400 "This model does not support enable_search"
+	// in both streaming and non-streaming mode; /responses runs web_search + code_interpreter;
+	// both image tools rejected; reasoning_effort only accepts low|high|max (xhigh/medium 400).
+	"glm-5.3": { chat: chat(false, false, false), responses: IMG(false, false) },
+	// Measured 2026-10-10: chat enable_search accepted, all five /responses built-ins accepted
+	// (both image tools fired), and chat enable_code_interpreter needs STREAMING mode: a
+	// non-streaming probe 400s with "Non-streaming mode does not support Code interpreter",
+	// which reads like a capability rejection and is not one. pi always streams.
+	"deepseek-v4.1-flash": { chat: chat(true, true, true), responses: IMG(false, false) },
+	// "auto" is the plan's router alias. Measured 2026-10-10: chat enable_search accepted,
+	// /responses web_search accepted, all reasoning_effort levels accepted. It routes to some
+	// model I cannot see, so only the cells I actually exercised are set; assume nothing else.
+	"auto": { chat: chat(true, false, false), responses: IMG(false, false) },
 	"wan2.7-image": { chat: chat(false, false, false), responses: NO_RES },
 	"wan2.7-image-pro": { chat: chat(false, false, false), responses: NO_RES },
 	"qwen-audio-3.0-tts-plus": { chat: chat(false, false, false), responses: NO_RES },
@@ -103,19 +118,97 @@ export function modelsSupporting(tool: keyof Caps["responses"]): string[] {
 		.map(([id]) => id);
 }
 
-/** Unknown models: assume the common three, assume not the image tools. */
-const UNKNOWN_CAPS: Caps = { chat: chat(true, false, false), responses: IMG(false, false) };
+/**
+ * Family defaults for ids missing from CAPS, so a dated release (glm-5.4,
+ * deepseek-v4.2-flash-1101, qwen3.9-max-...) inherits the family's measured shape
+ * instead of falling through to UNKNOWN_CAPS. First match wins, so the
+ * generation-only rule must stay ahead of the qwen chat rule.
+ */
+const FAMILY_CAPS: Array<{ match: RegExp; caps: Caps; why: string }> = [
+	{
+		match: /^(qwen-(audio|image)|wan|happyhorse)/i,
+		caps: { chat: chat(false, false, false), responses: NO_RES },
+		why: "native generation endpoint, not a chat model",
+	},
+	{
+		// Every GLM on this plan so far rejects chat enable_search (glm-5.2, glm-5.3).
+		match: /^glm/i,
+		caps: { chat: chat(false, false, false), responses: IMG(false, false) },
+		why: "GLM runs /responses built-ins but rejects enable_search on chat",
+	},
+	{
+		match: /^deepseek/i,
+		caps: { chat: chat(true, true, true), responses: IMG(false, false) },
+		why: "DeepSeek on this plan takes chat search, agent mode and code interpreter",
+	},
+	{
+		match: /^qwen[-.\d]/i,
+		caps: { chat: chat(true, false, false), responses: IMG(false, false) },
+		why: "Qwen chat models take turbo/max search injection",
+	},
+];
 
-function capsFor(modelId: string): Caps {
-	return CAPS[modelId] ?? UNKNOWN_CAPS;
+/**
+ * Unknown models: assume the /responses tools work, assume NOTHING about chat
+ * enable_search. The asymmetry is deliberate. A wrong `true` here was a poison
+ * pill: glm-5.3 shipped on the plan, matched no CAPS row, took the injected
+ * enable_search, and every single turn 400'd until the table was edited. A wrong
+ * `false` only costs the passive search bonus, and `qwen_web_search` still works.
+ */
+const UNKNOWN_CAPS: Caps = { chat: chat(false, false, false), responses: IMG(false, false) };
+
+/** The runtime-learned skips live in config.searchBlocklist; see learnSearchReject(). */
+
+function familyCaps(modelId: string): { caps: Caps; why: string } | undefined {
+	return FAMILY_CAPS.find((rule) => rule.match.test(modelId));
+}
+
+function baseCaps(modelId: string): Caps {
+	return CAPS[modelId] ?? familyCaps(modelId)?.caps ?? UNKNOWN_CAPS;
+}
+
+/** Family defaults, exported so the unit test can assert inference without the network. */
+export function capsFor(modelId: string): Caps {
+	const caps = baseCaps(modelId);
+	// The runtime blocklist only ever removes a capability, never grants one.
+	if (!config.searchBlocklist.includes(modelId)) return caps;
+	return { ...caps, chat: { ...caps.chat, search: false } };
+}
+
+/** Where a model's caps came from, for the /qtools-config capability readout. */
+export function capsSource(modelId: string): string {
+	if (config.searchBlocklist.includes(modelId)) return "learned: rejects enable_search";
+	if (CAPS[modelId]) return "measured";
+	return familyCaps(modelId)?.why ?? "unknown model, no capabilities assumed";
 }
 
 /**
- * glm-5.2 returns "This model does not support enable_search", which would break
- * EVERY turn rather than just searches, so the main-loop injection is gated.
+ * glm-5.2 and glm-5.3 return "This model does not support enable_search", which
+ * breaks EVERY turn rather than just searches, so the main-loop injection is gated.
  */
-function searchCapable(modelId: string): boolean {
+export function searchCapable(modelId: string): boolean {
 	return capsFor(modelId).chat.search;
+}
+
+/** Test/maintenance hook: the ids the runtime has learned to leave alone. */
+export function learnedSearchSkips(): string[] {
+	return [...config.searchBlocklist];
+}
+
+/**
+ * pi never fires after_provider_response for a non-2xx (the OpenAI SDK throws first), so the
+ * capability verdict comes from the finalized assistant message instead: it carries the request
+ * model id and the upstream error text, which names enable_search. Matching that text is what
+ * makes this safe — an input-length 400 cannot be mistaken for a capability verdict, and no
+ * request/response pairing or cross-request state is needed.
+ */
+const SEARCH_REJECTED = /enable_search/i;
+
+function learnSearchReject(modelId: string): boolean {
+	if (config.searchBlocklist.includes(modelId)) return false;
+	config.searchBlocklist = [...config.searchBlocklist, modelId];
+	saveConfig();
+	return true;
 }
 
 // --------------------------------------------------------------------- config
@@ -132,6 +225,12 @@ interface QwenToolsConfig {
 	/** Defaults for the generation models (native endpoints, not chat models). */
 	imageModel: string;
 	videoModel: string;
+	/**
+	 * Model ids that answered an injected enable_search with a 400. Learned at runtime
+	 * so one unmeasured model can never break every turn the way glm-5.3 did; cleared
+	 * by deleting entries from the file or with /qtools-config -> learned skips.
+	 */
+	searchBlocklist: string[];
 }
 
 /** Verified working on this plan via the native multimodal-generation endpoint. */
@@ -142,11 +241,12 @@ const VIDEO_SIZES = ["1280*720", "1920*1080", "832*480"];
 
 const DEFAULTS: QwenToolsConfig = {
 	searchMode: "turbo",
-	fallbackModel: "qwen3.7-max",
+	fallbackModel: "qwen3.6-flash",
 	showReasoning: false,
 	deepSearchMaxTokens: 16384,
 	imageModel: "wan2.7-image",
 	videoModel: "happyhorse-1.1-t2v",
+	searchBlocklist: [],
 };
 
 const MODE_NOTES: Record<SearchMode, string> = {
@@ -192,6 +292,9 @@ function loadConfig(): void {
 			fallbackModel: typeof raw.fallbackModel === "string" && raw.fallbackModel ? raw.fallbackModel : DEFAULTS.fallbackModel,
 			imageModel: IMAGE_MODELS.includes(raw.imageModel ?? "") ? raw.imageModel! : DEFAULTS.imageModel,
 			videoModel: VIDEO_MODELS.includes(raw.videoModel ?? "") ? raw.videoModel! : DEFAULTS.videoModel,
+			searchBlocklist: Array.isArray(raw.searchBlocklist)
+				? raw.searchBlocklist.filter((id): id is string => typeof id === "string" && id.length > 0)
+				: DEFAULTS.searchBlocklist,
 		};
 		// Migrate the old filename once so the new one is authoritative.
 		if (source !== p) saveConfig();
@@ -235,26 +338,71 @@ async function resolveEndpoint(ctx: ExtensionContext): Promise<{ baseUrl: string
 	return { baseUrl, apiKey };
 }
 
-/** Chat-completions agent-mode side call (deep search): needs chat.agent support. */
-function pickChatCapable(ctx: ExtensionContext, requested?: string): string {
-	const active = ctx.model?.id ?? "";
-	for (const c of [requested, active, config.fallbackModel]) {
-		if (c && capsFor(c).chat.agent) return c;
-	}
-	return "qwen3.7-max";
+/**
+ * Cheap-first candidate order for the fallback chain. The plan bills a max tier at a
+ * several-times-higher ratio than a flash tier, so the chain is ordered by price, not by
+ * recency, and `qwen3.6-flash` leads because it is the cheapest id measured running every
+ * tool surface: chat search/agent/code plus all five /responses tools. Never hardcode an
+ * endpoint here; add an id and let capsFor() decide who is eligible.
+ */
+const FALLBACK_CHAIN = [
+	"qwen3.6-flash",
+	"qwen3.8-flash",
+	"qwen3.7-plus",
+	"deepseek-v4-flash",
+	"deepseek-v4.1-flash",
+	"qwen3.7-max",
+	"qwen3.8-max",
+];
+
+/** Exported so the TUI and the tests show the same chain the pickers walk. */
+export function fallbackChain(): string[] {
+	return [config.fallbackModel, ...FALLBACK_CHAIN.filter((id) => id !== config.fallbackModel)];
+}
+
+/** The order a picker walks: explicit request, then active model, then the cheap-first chain. */
+export function candidateOrder(active?: string, requested?: string): string[] {
+	return [requested, active, ...fallbackChain()].filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
+/** Pure half of the pickers, so the fallback order is testable without a pi context. */
+export function chooseModel(eligible: (id: string) => boolean, active?: string, requested?: string): string | undefined {
+	return candidateOrder(active, requested).find((id) => eligible(id));
 }
 
 /**
- * /responses tools: keep the ACTIVE model. Every chat model on this plan runs all
- * three built-in tools there, so downgrading to the fallback would silently bill a
- * different model than the one the user selected.
+ * Walk requested -> active -> config.fallbackModel -> FALLBACK_CHAIN and return the first
+ * id `eligible` accepts. undefined means no model on the plan can run the capability.
+ */
+function pickModel(ctx: ExtensionContext, eligible: (id: string) => boolean, requested?: string): string | undefined {
+	return chooseModel(eligible, ctx.model?.id, requested);
+}
+
+/** Chat-completions agent-mode side call (deep search): needs chat.agent support. */
+function pickChatCapable(ctx: ExtensionContext, requested?: string): string {
+	const id = pickModel(ctx, (c) => capsFor(c).chat.agent, requested);
+	if (id) return id;
+	throw new Error(
+		`No model on this plan runs chat agent mode (search_strategy: "agent"). Candidates tried: ${candidateOrder(
+			ctx.model?.id,
+			requested,
+		).join(", ")}.`,
+	);
+}
+
+/**
+ * /responses tools: keep the ACTIVE model whenever it can serve the tool, so the model the
+ * user selected is the one billed and the one writing the answer. Only step off it when its
+ * row says no, and then step onto the cheapest capable id rather than a fixed expensive one.
  */
 function pickResponsesModel(ctx: ExtensionContext, tool: keyof Caps["responses"], requested?: string): string {
-	const active = ctx.model?.id ?? "";
-	for (const c of [requested, active, config.fallbackModel]) {
-		if (c && capsFor(c).responses[tool]) return c;
-	}
-	return "qwen3.7-max";
+	const id = pickModel(ctx, (c) => capsFor(c).responses[tool], requested);
+	if (id) return id;
+	const works = modelsSupporting(tool);
+	throw new Error(
+		`No model on this plan runs the /responses "${tool}" tool.` +
+			(works.length ? ` Measured working on: ${works.join(", ")}.` : " Nothing has been measured working on it yet."),
+	);
 }
 
 // --------------------------------------------------------------- /responses
@@ -967,12 +1115,36 @@ const TYPE_MAP: Array<{ label: string; type: string; tool: string }> = [
 	{ label: "i2i_search", type: "image_search", tool: "qwen_reverse_image_search" },
 ];
 
-function capabilityItems(): SelectItem[] {
+/**
+ * Real model ids with their measured rows. This is the list the fallback-model submenu
+ * offers, so it must stay id-only: a family rule or the "anything else" row is not a
+ * model id, and selecting one would write "family:0" into config.fallbackModel.
+ */
+function modelIdItems(): SelectItem[] {
 	return Object.entries(CAPS).map(([id, caps]) => ({
 		value: id,
 		label: id,
 		description: capabilitySummary(caps),
 	}));
+}
+
+/**
+ * Read-only capability browser: measured rows first, then the family rules that catch ids
+ * nobody measured, then the fail-safe default, so provenance is visible without guessing.
+ */
+function capabilityItems(): SelectItem[] {
+	const rows: SelectItem[] = modelIdItems();
+	rows.push(...FAMILY_CAPS.map((rule, i) => ({
+		value: `family:${i}`,
+		label: `family ${rule.match.source}`,
+		description: `${capabilitySummary(rule.caps)} | inferred: ${rule.why}`,
+	})));
+	rows.push({
+		value: "unknown",
+		label: "anything else",
+		description: `${capabilitySummary(UNKNOWN_CAPS)} | fail-safe: nothing assumed about enable_search`,
+	});
+	return rows;
 }
 
 function typeMapItems(): SelectItem[] {
@@ -991,16 +1163,27 @@ function descriptionFor(id: string, ctx: ExtensionContext): string {
 		case "searchMode":
 			return (
 				MODE_NOTES[config.searchMode] +
-				(caps.chat.search ? "" : ` — WARNING: ${model} rejects enable_search, so injection is skipped`)
+				(caps.chat.search
+					? ""
+					: ` — WARNING: ${model} rejects enable_search (${capsSource(model)}), so injection is skipped`) +
+				(config.searchBlocklist.length ? ` | learned skips: ${config.searchBlocklist.join(", ")}` : "")
 			);
 		case "fallbackModel":
-			return `Model the qwen_* tools run on only when the active model cannot. Currently ${config.fallbackModel}. (/responses tools use the active model — every chat model here supports them.)`;
+			return (
+				`Head of the cheap-first chain the qwen_* tools step onto when the ACTIVE model cannot serve a ` +
+				`tool. Currently ${config.fallbackModel}; chain tried in order: ${fallbackChain().join(" -> ")}. ` +
+				`The active model is always preferred, so this only matters for models with gaps (GLM rejects image tools).`
+			);
 		case "showReasoning":
 			return "Adds the model's own plan/rationale to tool results. More context, more tokens.";
 		case "deepSearchMaxTokens":
 			return `max_tokens cap for qwen_deep_search. It burned ~340k prompt tokens uncapped; limit is ${config.deepSearchMaxTokens} now.`;
 		case "capabilities":
 			return "Measured against the live endpoint. Note the two image tools are gated differently.";
+		case "learnedSkips":
+			return config.searchBlocklist.length
+				? `Unmeasured models that took a 400 on the injected enable_search: ${config.searchBlocklist.join(", ")}. Select clear to forget them.`
+				: "No runtime-learned skips. A 400 on an injected request for an unmeasured model lands here.";
 		case "imageModel":
 			return `Default for qwen_generate_image and /qimage. All three verified working via the native multimodal-generation endpoint.`;
 		case "videoModel":
@@ -1020,7 +1203,8 @@ function buildItems(ctx: ExtensionContext, th: ThemeLike): SettingItem[] {
 	const capLine =
 		`${model}: chat ${y(caps.chat.search)}${y(caps.chat.agent)}${y(caps.chat.ci)}` +
 		` | res ${y(caps.responses.web_search)}${y(caps.responses.code_interpreter)}${y(caps.responses.web_extractor)}` +
-		`${y(caps.responses.web_search_image)}${y(caps.responses.image_search)}`;
+		`${y(caps.responses.web_search_image)}${y(caps.responses.image_search)}` +
+		` | ${capsSource(model)}`;
 	return [
 		{
 			id: "searchMode",
@@ -1038,7 +1222,7 @@ function buildItems(ctx: ExtensionContext, th: ThemeLike): SettingItem[] {
 			// closeSubmenu() leaves submenuComponent set, so the submenu never closes
 			// (onChange still fires, so it looks like a render hang). The cursor already
 			// returns to this row, so navigateTo buys nothing here.
-			submenu: (current, done) => makeSubmenu(th, "Built-in tool model", capabilityItems(), current, (v) => done(v)),
+			submenu: (current, done) => makeSubmenu(th, "Built-in tool model", modelIdItems(), current, (v) => done(v)),
 		},
 		{
 			id: "showReasoning",
@@ -1104,6 +1288,13 @@ function buildItems(ctx: ExtensionContext, th: ThemeLike): SettingItem[] {
 			submenu: (_current, done) => makeSubmenu(th, "Per-model capabilities", capabilityItems(), "", () => done(undefined)),
 		},
 		{
+			id: "learnedSkips",
+			label: "learned skips",
+			description: descriptionFor("learnedSkips", ctx),
+			currentValue: config.searchBlocklist.length ? config.searchBlocklist.join(", ") : "none",
+			values: ["clear"],
+		},
+		{
 			id: "provider",
 			label: "Provider",
 			description: descriptionFor("provider", ctx),
@@ -1118,7 +1309,9 @@ function applyChange(id: string, value: string): void {
 			if (SEARCH_MODES.includes(value as SearchMode)) config.searchMode = value as SearchMode;
 			break;
 		case "fallbackModel":
-			if (value) config.fallbackModel = value;
+			// Guard the submenu contract: anything that is not a measured id would silently
+			// demote the whole fallback chain to "no capable model found".
+			if (value && CAPS[value]) config.fallbackModel = value;
 			break;
 		case "showReasoning":
 			config.showReasoning = value === "enabled";
@@ -1128,6 +1321,9 @@ function applyChange(id: string, value: string): void {
 			break;
 		case "videoModel":
 			if (VIDEO_MODELS.includes(value)) config.videoModel = value;
+			break;
+		case "learnedSkips":
+			if (value === "clear") config.searchBlocklist = [];
 			break;
 		case "deepSearchMaxTokens": {
 			const n = Number.parseInt(value, 10);
@@ -1163,6 +1359,34 @@ export default function (pi: ExtensionAPI): void {
 				enable_citation: config.searchMode === "max",
 			},
 		};
+	});
+
+	// ---- self-heal: an enable_search error retires that model's passive search ----
+	pi.on("message_end", (event, ctx) => {
+		const message = event.message as {
+			role?: string;
+			provider?: string;
+			model?: string;
+			stopReason?: string;
+			errorMessage?: string;
+		};
+		if (message.role !== "assistant" || message.stopReason !== "error") return;
+		if (!(message.provider ?? "").startsWith(PROVIDER_PREFIX)) return;
+		const detail = message.errorMessage ?? "";
+		if (!SEARCH_REJECTED.test(detail)) return;
+		const id = message.model;
+		if (!id) return;
+		// Only unmeasured ids get to learn: the table is authoritative, and a measured model
+		// that suddenly rejects search is an upstream change the maintainer should see as an
+		// error rather than have silently reconfigured around.
+		if (CAPS[id]) return;
+		if (!learnSearchReject(id)) return;
+		ctx.ui.notify(
+			`qtools: ${id} is unmeasured and rejected the injected enable_search, so passive search is now ` +
+				`skipped for it (qwen_web_search still works). New ids belong in CAPS in extensions/qtools.ts; ` +
+				`this skip is in config.searchBlocklist, clearable via /qtools-config -> learned skips.`,
+			"warning",
+		);
 	});
 
 	// ------------------------------------------------------------------- tools
@@ -1258,7 +1482,9 @@ export default function (pi: ExtensionAPI): void {
 		description:
 			"Search the web for images matching a text description, using Qwen's server-side web_search_image " +
 			"tool. Returns the image URLs it found plus the queries it issued. Qwen runs the retrieval; results " +
-			"are real URLs, not model guesses. Supported by qwen3.8-max only on this plan.",
+			"are real URLs, not model guesses. Runs on the plan's flash tiers as well (qwen3.6-flash, " +
+			"qwen3.7-plus, qwen3.8-flash, qwen3.8-max); glm-* and deepseek-* cannot, and those calls are " +
+			"routed to a capable model for you.",
 		promptSnippet: "Find images on the web from a text description",
 		promptGuidelines: [
 			"Use qwen_image_search when the user wants pictures of something found on the web, as opposed to qwen_web_search which retrieves text sources.",
@@ -1266,7 +1492,7 @@ export default function (pi: ExtensionAPI): void {
 		],
 		parameters: Type.Object({
 			query: Type.String({ description: "What to find images of, as a short descriptive phrase." }),
-			model: Type.Optional(Type.String({ description: "Override model id (only qwen3.8-max supports this tool)." })),
+			model: Type.Optional(Type.String({ description: "Override model id (flash tiers work here)." })),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
 			onUpdate?.({ content: [{ type: "text", text: `image search: ${params.query}` }] });

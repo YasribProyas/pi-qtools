@@ -28,7 +28,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The glm-5.3 lesson: a capability default that assumes too much breaks every turn,
+  # so the gating logic is checked before anything reaches the registry.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install peer dependencies (pi-coding-agent, pi-tui, typebox)
+        run: npm install --no-audit --no-fund
+      - name: Capability gating tests
+        run: node --experimental-strip-types test/caps.test.mjs
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     # Hardening: create an environment named `npm` in repo Settings ->
     # Environments, uncomment below, and set the same name as the

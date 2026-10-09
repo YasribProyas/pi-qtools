@@ -16,7 +16,7 @@ Requires a `qwen-token-plan*` provider authenticated in pi (`/login`).
 | `qwen_web_search` | `/responses` `web_search` | answer + queries issued + source URLs |
 | `qwen_web_extractor` | `/responses` `web_search` + `web_extractor` | page text filtered to a stated goal; the API requires the search tool alongside |
 | `qwen_code_interpreter` | `/responses` `code_interpreter` | returns the Python it ran, container id, real stdout |
-| `qwen_image_search` | `/responses` `web_search_image` | text → image URLs. **qwen3.8-max only** |
+| `qwen_image_search` | `/responses` `web_search_image` | text → image URLs. Runs on flash tiers too (see the matrix) |
 | `qwen_reverse_image_search` | `/responses` `image_search` | image URL or local file → similar images; accepts a local path and inlines it as a data URL (4 MB cap) |
 | `qwen_deep_search` | chat `search_strategy: "agent"` | multi-step research; very expensive (~340k prompt tokens observed) |
 | `qwen_generate_image` | native `multimodal-generation` | `wan2.7-image`, `wan2.7-image-pro`, `qwen-image-3.0-pro`; sync; `image` edits a reference picture; `save: true` writes into `<cwd>/out/qtools/` |
@@ -122,11 +122,12 @@ Persisted to `<agentDir>/qtools.json` (migrated automatically from the older
 ```json
 {
   "searchMode": "turbo",
-  "fallbackModel": "qwen3.7-max",
+  "fallbackModel": "qwen3.6-flash",
   "showReasoning": false,
   "deepSearchMaxTokens": 16384,
   "imageModel": "wan2.7-image",
-  "videoModel": "happyhorse-1.1-t2v"
+  "videoModel": "happyhorse-1.1-t2v",
+  "searchBlocklist": []
 }
 ```
 
@@ -137,16 +138,106 @@ surfaces differ per model:
 
 | model | chat search | agent | chat code_int | `/responses` tools | `web_search_image` | `image_search` |
 |---|---|---|---|---|---|---|
-| qwen3.8-max | yes | no | no | all | **yes** | yes |
-| qwen3.8-flash | yes | no | no | s/c/e | no | yes |
-| qwen3.7-max | yes | yes | yes | s/c/e | no | no |
-| qwen3.7-plus | yes | yes | yes | s/c/e | no | yes |
-| qwen3.6-flash | yes | yes | yes | s/c/e | no | yes |
+| qwen3.8-max | yes | no | no | all | yes | yes |
+| qwen3.8-flash | yes | no | no | all | **yes** | yes |
+| qwen3.7-max | yes | yes | yes | s/c/e | **no** | **no** |
+| qwen3.7-plus | yes | yes | yes | all | **yes** | yes |
+| qwen3.6-flash | yes | yes | yes | all | **yes** | **yes** |
 | deepseek-v4-* | yes | yes | yes | s/c/e | no | no |
+| deepseek-v4.1-flash | yes | (inherited) | yes (streaming) | s/c/e | no | no |
 | glm-5.2 | **no** | no | no | s/c/e | no | no |
+| glm-5.3 | **no** | no | no | s/c/e | no | no |
+| auto (plan router) | yes | unknown | unknown | s/c/e | no | no |
+| anything unmeasured | **no** | no | no | s/c/e | no | no |
 
-`glm-5.2` rejects `enable_search` with a hard error, so injection is skipped for it;
-without that guard every turn would fail after a model switch.
+Two corrections from the 2026-10-10 remeasurement, both of which were load-bearing bugs:
+
+- **`web_search_image` is not qwen3.8-max-only.** The table used to claim that, and it
+  is wrong: qwen3.6-flash, qwen3.7-plus and qwen3.8-flash all fire `web_search_image_call`.
+- **qwen3.7-max cannot run either image tool** — it 400s on both. Since it was the
+  hardcoded last resort in the pickers, a GLM model asking for image search used to be
+  routed to a model that then failed the call, on the most expensive tier on the plan.
+
+`agent` = chat `search_strategy: "agent"` (qwen_deep_search). `s/c/e` = `/responses`
+web_search / code_interpreter / web_extractor. Cells marked (inherited) come from the
+family rule, not from a direct measurement of that id.
+
+`glm-5.2` and `glm-5.3` reject `enable_search` with a hard error, so injection is
+skipped for them; without that guard every turn would fail after a model switch. They
+can still *use* the search tools: `/responses` web_search, code_interpreter and
+web_extractor all run on a GLM model — only the passive chat injection is lost.
+
+### Which model runs a tool
+
+`requested -> active -> config.fallbackModel -> FALLBACK_CHAIN`, first capable id wins:
+
+- The **active** model is used whenever its row allows the tool, so selecting a model
+  is not a silent invitation to bill a different one — and the answering model is also
+  the model that writes the search queries and reads the pages.
+- Only when the active row says no does the chain step off it, and it steps onto the
+  **cheapest capable** id, not a fixed one. The chain is `qwen3.6-flash -> qwen3.8-flash
+  -> qwen3.7-plus -> deepseek-v4-flash -> deepseek-v4.1-flash -> qwen3.7-max ->
+  qwen3.8-max`, led by `config.fallbackModel` (default `qwen3.6-flash`, the cheapest id
+  measured running every surface). Max tiers sit at the end because the plan bills them
+  at several times a flash tier.
+- If nothing can serve the capability, the tool **errors with the list of models that
+  were tried** instead of quietly calling a model that will 400.
+
+Passive injection has no such choice: it rides inside the active model's own
+`/chat/completions` body, which is why the capability table exists at all.
+
+### How an unknown model id is handled
+
+Three layers, in this order. `node --experimental-strip-types test/caps.test.mjs`
+pins all of them.
+
+1. **Exact row** in `CAPS` (`extensions/qtools.ts`) — measured, authoritative.
+2. **Family rule** (`FAMILY_CAPS`) — a regex on the id, so a dated release like
+   `glm-5.4` or `qwen3.9-max-1105` inherits its family's shape instead of falling
+   through. The generation-only rule (`qwen-audio-*`, `qwen-image-*`, `wan*`,
+   `happyhorse*`) must stay first, or a future `qwen-audio` id would be read as a
+   chat model. `/qtools-config` -> per-model capabilities lists the rules, and the
+   active model's line says which layer answered for it.
+3. **Fail-safe default** — `UNKNOWN_CAPS.chat.search = false`. This is deliberate
+   and is the whole point of the layering: a wrong `true` broke *every* turn when
+   glm-5.3 shipped and matched nothing, while a wrong `false` only costs the passive
+   search bonus and `qwen_web_search` still works.
+
+If a *family guess* turns out wrong, the extension heals itself: the finalized
+assistant message carries the request model id and the upstream error text, so when
+that text mentions `enable_search` the id is appended to `config.searchBlocklist`
+and later turns skip the injection. One bad turn, not forever. Clear them in
+`/qtools-config` -> learned skips. Measured ids never learn — the table outranks the
+runtime, and a verified model that suddenly rejects search should surface as an
+error rather than be silently reconfigured around.
+
+### Adding a model the plan just shipped
+
+1. Check whether pi even lists it. The plan's own `/models` is not the same set as
+   the pi.dev catalogue; on 2026-10-09 the endpoint served `glm-5.3`,
+   `deepseek-v4.1-flash` and `auto` while pi's catalogue listed none of them. Add the
+   missing id to `~/.pi/agent/models.json` under the provider, mirroring a sibling
+   row's `compat`/`thinkingLevelMap`, and verify `reasoning_effort` levels by hand —
+   glm-5.3 accepts only `low|high|max` and 400s on `medium`/`xhigh`, and it silently
+   drops image parts, so declare `input: ["text"]`.
+2. Measure the chat surface: `enable_search`, and `enable_code_interpreter` **in
+   streaming mode** (non-streaming rejects it with a misleading 400).
+3. Measure the `/responses` surface with the real `tools[].type` strings, not the
+   console labels (see Known gaps).
+4. Add the row to `CAPS`, run both test scripts, then release.
+
+## Testing
+
+```sh
+node --experimental-strip-types test/caps.test.mjs   # capability gating, no network
+bash test/injection.e2e.sh                          # live injection behaviour against a mock
+```
+
+`test/injection.e2e.sh` boots `test/mock_endpoint.py` on 127.0.0.1, runs real `pi -p`
+sessions in a throwaway `PI_CODING_AGENT_DIR`, and asserts whether `enable_search`
+reached the wire for a family-yes id, a glm id, an unmeasured id, and a deliberately
+wrong family guess (which must be learned after one rejected turn). Nothing leaves
+the machine and your own `~/.pi/agent` is never touched.
 
 ## Known gaps
 
