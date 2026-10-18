@@ -162,6 +162,10 @@ Two corrections from the 2026-10-10 remeasurement, both of which were load-beari
 web_search / code_interpreter / web_extractor. Cells marked (inherited) come from the
 family rule, not from a direct measurement of that id.
 
+Capability state lives in `src/capabilities.ts` (the measured table, the family rules, the
+fail-safe default, the fallback chain) and imports nothing, so it is testable with no pi and
+no network. `extensions/qtools.ts` owns everything else: config file, HTTP, tools, TUI.
+
 `glm-5.2` and `glm-5.3` reject `enable_search` with a hard error, so injection is
 skipped for them; without that guard every turn would fail after a model switch. They
 can still *use* the search tools: `/responses` web_search, code_interpreter and
@@ -224,14 +228,32 @@ error rather than be silently reconfigured around.
    streaming mode** (non-streaming rejects it with a misleading 400).
 3. Measure the `/responses` surface with the real `tools[].type` strings, not the
    console labels (see Known gaps).
-4. Add the row to `CAPS`, run both test scripts, then release.
+4. Add the row to `CAPS` in `src/capabilities.ts`, run `npm test`, then release. If the id
+   matches a `FAMILY_CAPS` rule, measure it anyway: family rules are inferences, and only a
+   `CAPS` row is reported as `measured`.
 
 ## Testing
 
 ```sh
-node --experimental-strip-types test/caps.test.mjs   # capability gating, no network
-bash test/injection.e2e.sh                          # live injection behaviour against a mock
+npm test                                  # parse guard + capability gating, no dependencies
+bash test/injection.e2e.sh                # live injection behaviour against a mock (needs pi)
 ```
+
+`npm test` is two dependency-free scripts, and that is deliberate: CI runs it with **no
+install step**, so a missing or mismatched pi package cannot break a release.
+
+- `test/parse.check.mjs` imports `extensions/qtools.ts` and counts `ERR_MODULE_NOT_FOUND` as
+  success, because module resolution happens only *after* the TypeScript is parsed. It exists
+  because a table extraction once left two copies of `export function learnedSearchSkips` in
+  the file, and pi only reported that at load time as
+  `Failed to load extension ... has already been declared`. A file that cannot parse must
+  never reach `npm publish`.
+- `test/caps.test.mjs` asserts the gating rules by importing `src/capabilities.ts` directly.
+
+The workflow also fails the build if `node_modules` is ever tracked again: a node_modules
+**symlink** is not caught by the usual `node_modules/` gitignore pattern (git stores symlinks
+as files, mode `120000`), and one once shipped an absolute path from a maintainer's laptop
+into the public repo. The ignore rule is `node_modules`, no trailing slash.
 
 `test/injection.e2e.sh` boots `test/mock_endpoint.py` on 127.0.0.1, runs real `pi -p`
 sessions in a throwaway `PI_CODING_AGENT_DIR`, and asserts whether `enable_search`

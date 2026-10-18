@@ -11,8 +11,18 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const mod = await import(join(here, "..", "extensions", "qtools.ts"));
-const { capsFor, capsSource, searchCapable, chooseModel, candidateOrder, fallbackChain } = mod;
+// Import the pure capability module, NOT the extension: the extension imports pi, which
+// would make this test need a full pi install. That is the whole reason the table moved.
+const { createCaps, CAPS, FALLBACK_CHAIN, modelsSupporting } = await import(
+	join(here, "..", "src", "capabilities.ts")
+);
+
+// A reader with a fixed learned-skip list, mirroring how the extension wires the config.
+let learned = [];
+const { capsFor, capsSource, searchCapable, chooseModel, candidateOrder, fallbackChain } = createCaps({
+	blocklist: () => learned,
+	fallbackModel: () => "qwen3.6-flash",
+});
 
 let failures = 0;
 function check(name, fn) {
@@ -126,6 +136,39 @@ check("chat agent mode (deep search) resolves off a GLM model", () => {
 check("an impossible capability resolves to undefined, not to a model that will 400", () => {
 	assert.equal(chooseModel(() => false, "glm-5.3"), undefined);
 });
+
+// 8. A learned skip only ever removes a capability, and clearing it restores. Use a
+//    family-capable id: an unmeasured id is already false thanks to the fail-safe default,
+//    so it would prove nothing here.
+{
+	const id = "qwen3.9-flash"; // family rule -> chat search yes
+	learned = [];
+	const r = createCaps({ blocklist: () => learned, fallbackModel: () => "qwen3.6-flash" });
+	try {
+		assert.equal(r.searchCapable(id), true, "family rule grants search before the skip");
+		learned = [id];
+		assert.equal(r.searchCapable(id), false, "learned skip blocks search");
+		assert.equal(r.capsSource(id), "learned: rejects enable_search");
+		assert.equal(r.capsFor(id).responses.web_search, true, "skip must not touch /responses");
+		learned = [];
+		assert.equal(r.searchCapable(id), true, "clearing the skip restores it");
+		console.log("  ok   learned skip only subtracts, and clearing restores");
+	} catch (e) {
+		failures++;
+		console.log(`  FAIL learned skip behaviour\n       ${e.message.split("\n")[0]}`);
+	}
+}
+
+// 9. Table sanity: every chain entry must be a real measured row, or the chain is a guess.
+{
+	const unmeasured = FALLBACK_CHAIN.filter((id) => !CAPS[id]);
+	if (unmeasured.length === 0) {
+		console.log("  ok   every fallback-chain id has a measured row");
+	} else {
+		failures++;
+		console.log(`  FAIL chain ids with no CAPS row: ${unmeasured.join(", ")}`);
+	}
+}
 
 console.log(failures === 0 ? "\nall capability tests passed" : `\n${failures} capability test(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

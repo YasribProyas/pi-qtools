@@ -29,7 +29,9 @@ concurrency:
 
 jobs:
   # The glm-5.3 lesson: a capability default that assumes too much breaks every turn,
-  # so the gating logic is checked before anything reaches the registry.
+  # so the gating logic is checked before anything reaches the registry. It runs with no
+  # install step on purpose: test/caps.test.mjs imports src/capabilities.ts, which imports
+  # nothing, so CI cannot fail on a missing pi package and cannot drift from a pi release.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -37,10 +39,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Install peer dependencies (pi-coding-agent, pi-tui, typebox)
-        run: npm install --no-audit --no-fund
-      - name: Capability gating tests
-        run: node --experimental-strip-types test/caps.test.mjs
+      - name: Refuse a tracked node_modules
+        # A node_modules SYMLINK is not matched by the `node_modules/` gitignore pattern
+        # (git stores symlinks as files, mode 120000). That once shipped a symlink holding
+        # an absolute path from a maintainer's laptop into the public repo.
+        run: |
+          if [ -n "$(git ls-files node_modules)" ]; then
+            echo "::error::node_modules is committed (git ls-files node_modules is non-empty). Untrack it."
+            exit 1
+          fi
+      - name: Parse guard + capability gating tests
+        run: npm test
 
   publish:
     needs: test

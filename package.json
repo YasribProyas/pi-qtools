@@ -1,6 +1,6 @@
 {
   "name": "pi-qtools",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Qwen Token Plan bridge for pi: web search, scraping, code interpreter, image search, and image/video generation via DashScope built-in tools and native task endpoints.",
   "type": "module",
   "keywords": [
@@ -31,6 +31,7 @@
   },
   "files": [
     "extensions",
+    "src",
     "README.md",
     "LICENSE"
   ],
@@ -56,6 +57,6 @@
     ]
   },
   "scripts": {
-    "test": "node --experimental-strip-types test/caps.test.mjs"
+    "test": "node --experimental-strip-types test/parse.check.mjs && node --experimental-strip-types test/caps.test.mjs"
   }
 }
