@@ -57,6 +57,6 @@
     ]
   },
   "scripts": {
-    "test": "node --experimental-strip-types test/parse.check.mjs && node --experimental-strip-types test/caps.test.mjs"
+    "test": "node --experimental-strip-types test/parse.check.mjs && node --experimental-strip-types test/caps.test.mjs && node --experimental-strip-types test/catalog.test.mjs"
   }
 }

@@ -39,6 +39,58 @@ import {
 	UNKNOWN_CAPS,
 	type Caps,
 } from "../src/capabilities.ts";
+import { mergeCatalog, PLAN_PROVIDERS, QTOOLS_MODELS } from "../src/catalog.ts";
+
+// ------------------------------------------------------- token-plan catalog
+
+/**
+ * pi's remote model catalog lags the plan's /models route, so usable chat models
+ * are simply unselectable. This overlays the ids we have measured on top of pi's
+ * own list, adding only what pi lacks.
+ *
+ * Two rules make this safe:
+ *  - refreshModels' return value REPLACES the provider's whole list, so pi's
+ *    baseline is carried through verbatim and its metadata wins for known ids.
+ *  - with no baseline to merge into we register nothing, rather than replacing
+ *    pi's catalog with only our four rows.
+ *
+ * Nothing is persisted: models-store.json belongs to pi's catalog refresh, and
+ * writing our overlay into it would corrupt its etag/lastModified bookkeeping.
+ */
+const catalogAdded = new Map<string, string[]>();
+
+function registerCatalogOverlay(pi: ExtensionAPI): void {
+	for (const provider of PLAN_PROVIDERS) {
+		try {
+			pi.registerProvider(provider, {
+				async refreshModels(context) {
+					const merged = mergeCatalog(context.stored?.models);
+					if (merged.unsafe) {
+						// No baseline yet. Returning [] here is DESTRUCTIVE: measured with
+						// pi 1.5.0, an empty return wiped all 11 built-in plan models
+						// (pi -ne showed 11, this extension showed 0). Return nothing so pi
+						// keeps its own list; we add ours on the next refresh, once pi has
+						// a stored catalog to merge into. pi's own providers do the same.
+						catalogAdded.delete(provider);
+						return undefined as never;
+					}
+					if (merged.added.length > 0) catalogAdded.set(provider, merged.added);
+					else catalogAdded.delete(provider);
+					return merged.models as never[];
+				},
+			});
+		} catch {
+			// A provider pi does not know, or a registration it rejects, must never
+			// take the rest of the extension down with it.
+		}
+	}
+}
+
+/** What the overlay added, for /qtools-config. */
+function catalogReport(): string {
+	if (catalogAdded.size === 0) return "pi's catalog already covers every measured model";
+	return [...catalogAdded.entries()].map(([p, ids]) => `${p}: +${ids.join(", ")}`).join(" | ");
+}
 
 // ------------------------------------------------------------------ capability
 
@@ -1028,6 +1080,12 @@ function descriptionFor(id: string, ctx: ExtensionContext): string {
 			return "Console capability labels differ from the API tools[].type strings. Sending a label is silently ignored.";
 		case "provider":
 			return "Where the API key and base URL come from, plus whether the active model is a Qwen plan model.";
+		case "catalog":
+			return (
+				`Chat models this package adds on top of pi's own catalog, which lags the plan's /models route. ` +
+				`${QTOOLS_MODELS.length} measured rows; pi's metadata always wins for ids it already knows. ` +
+				`Generation/audio ids are deliberately excluded: they are not chat models and would 400 in the picker.`
+			);
 	}
 	return "";
 }
@@ -1131,6 +1189,12 @@ function buildItems(ctx: ExtensionContext, th: ThemeLike): SettingItem[] {
 			values: ["clear"],
 		},
 		{
+			id: "catalog",
+			label: "Added plan models",
+			description: descriptionFor("catalog", ctx),
+			currentValue: catalogReport(),
+		},
+		{
 			id: "provider",
 			label: "Provider",
 			description: descriptionFor("provider", ctx),
@@ -1175,6 +1239,9 @@ function applyChange(id: string, value: string): void {
 loadConfig();
 
 export default function (pi: ExtensionAPI): void {
+	// Fill in plan models pi's catalog has not caught up with yet.
+	registerCatalogOverlay(pi);
+
 	// ---- main-loop web_search injection (chat/completions) ----
 	pi.on("before_provider_request", (event, ctx) => {
 		if (config.searchMode === "off" || !isQwen(ctx)) return undefined;

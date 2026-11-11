@@ -131,6 +131,51 @@ Persisted to `<agentDir>/qtools.json` (migrated automatically from the older
 }
 ```
 
+## Model catalog overlay
+
+pi ships its model list from a remote catalog that lags the plan. Measured against
+the live `/models` route: the plan serves **21** ids, pi's catalog knew **10**. Four
+of the missing ones are usable chat models that simply could not be selected.
+
+This package overlays its own measured list on top of pi's, adding only what pi
+lacks. It runs on every model refresh, so a pi update that drops or renames a model
+gets corrected on the next refresh without a manual edit.
+
+| added id | verified |
+|---|---|
+| `qwen4-max-preview` | chat, reasoning, image input, all 6 thinking levels |
+| `deepseek-v4.1-flash` | chat, reasoning, image input, all 6 thinking levels |
+| `deepseek-v4.1-flash-1017` | chat, reasoning, image input |
+| `auto` | plan router; chat, reasoning, image input |
+
+Every row was probed, not copied from a sibling model — the same rule the
+capability table follows after `glm-5.3` shipped unmeasured and 400'd every turn.
+`contextWindow`/`maxTokens` are plan-wide family values, not per-model measurements:
+the endpoint accepts `max_tokens=999999` without complaint, so it cannot reveal the
+real ceiling.
+
+**Generation and audio ids are deliberately excluded.** `wan2.7-image`,
+`qwen-image-3.0-pro`, `wan3.0-video` and `qwen-audio-3.0-*` are not chat models;
+adding them to pi's picker would create entries that 400 on every turn. This package
+already drives them through their native endpoints.
+
+### Two rules that keep it non-destructive
+
+pi's `refreshModels` return value **replaces the provider's entire model list**, so:
+
+1. pi's baseline is carried through verbatim, and **pi's own metadata wins** for any
+   id it already knows — its catalog is vendor-refreshed and may carry corrections.
+2. With no baseline to merge into, the overlay returns *nothing* and adds nothing.
+
+Rule 2 was learned the hard way. The first implementation returned `[]` on that
+path, which **wiped all 11 built-in plan models**. Measured with pi 1.5.0:
+`pi -ne --list-models` showed 11, the extension showed 0. Returning nothing keeps
+pi's list intact; the additions land on the next refresh once pi has a stored
+catalog. Nothing is persisted to `models-store.json` — that file belongs to pi's
+catalog refresh, and writing an overlay into it would corrupt its etag bookkeeping.
+
+`/qtools-config` reports what was added under **Added plan models**.
+
 ## Verified capability matrix
 
 Measured against the live endpoint rather than taken from docs, because the two
