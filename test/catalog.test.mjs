@@ -117,12 +117,14 @@ check("every curated row is a complete, measured chat model", () => {
 	}
 });
 
-check("all three plan providers are covered", () => {
+check("overlay covers only the measured ap-southeast-1 providers", () => {
 	assert.deepEqual([...PLAN_PROVIDERS].sort(), [
 		"qwen-token-plan",
-		"qwen-token-plan-cn",
 		"qwen-token-plan-individual",
 	]);
+	// cn-beijing is a different regional deployment; its /models route has never
+	// been probed (the SG key 401s there), so it must not inherit SG-measured ids.
+	assert.equal(PLAN_PROVIDERS.includes("qwen-token-plan-cn"), false);
 });
 
 console.log(failures === 0 ? "\n  all catalog tests passed" : `\n  ${failures} FAILED`);

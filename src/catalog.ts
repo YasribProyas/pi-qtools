@@ -92,11 +92,19 @@ export const QTOOLS_MODELS: readonly CatalogModel[] = [
 	model("auto", "Qwen Auto (plan router)", 131072),
 ];
 
-/** Provider ids this overlay applies to. All three are pi built-ins. */
+/**
+ * Provider ids this overlay applies to.
+ *
+ * Deliberately NOT all three plan providers: `qwen-token-plan-cn` serves
+ * cn-beijing, a different regional deployment whose model list has never been
+ * measured (the SG key returns 401 there). Pushing the SG-measured ids onto it
+ * would be exactly the unmeasured assumption that made glm-5.3 400 every turn.
+ * Both ids below share the ap-southeast-1 endpoint these rows were probed on.
+ * Add CN only after probing its /models route with a CN credential.
+ */
 export const PLAN_PROVIDERS = [
 	"qwen-token-plan",
 	"qwen-token-plan-individual",
-	"qwen-token-plan-cn",
 ] as const;
 
 export interface MergeResult {

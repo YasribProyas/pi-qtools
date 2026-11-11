@@ -150,9 +150,19 @@ gets corrected on the next refresh without a manual edit.
 
 Every row was probed, not copied from a sibling model — the same rule the
 capability table follows after `glm-5.3` shipped unmeasured and 400'd every turn.
+That includes `enable_search`: all four accept it, and prompt-token inflation
+(235-387 vs a ~10-28 baseline) confirms search actually ran rather than the flag
+merely being tolerated. They inherit `search=true` from the Qwen family rule, so
+this had to be measured rather than assumed.
 `contextWindow`/`maxTokens` are plan-wide family values, not per-model measurements:
 the endpoint accepts `max_tokens=999999` without complaint, so it cannot reveal the
 real ceiling.
+
+**Scope: `qwen-token-plan` and `qwen-token-plan-individual` only.** Both share the
+ap-southeast-1 endpoint these rows were measured on. `qwen-token-plan-cn` serves
+cn-beijing, a different regional deployment whose model list has never been probed
+(the SG key returns 401 there), so it is deliberately excluded rather than handed
+SG-measured ids. Add it only after probing its `/models` route with a CN credential.
 
 **Generation and audio ids are deliberately excluded.** `wan2.7-image`,
 `qwen-image-3.0-pro`, `wan3.0-video` and `qwen-audio-3.0-*` are not chat models;
